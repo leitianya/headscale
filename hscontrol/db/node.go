@@ -366,8 +366,8 @@ func NodeSetMachineKey(
 
 // EphemeralGarbageCollector is a garbage collector that will delete nodes after
 // a certain amount of time.
-// It is used to delete ephemeral nodes ([types.Node.IsEphemeral]) that have disconnected and should be
-// cleaned up.
+// It is used to delete ephemeral nodes ([types.Node.IsEphemeral]) that have disconnected, or never
+// connected, and should be cleaned up.
 type EphemeralGarbageCollector struct {
 	mu sync.Mutex
 
@@ -377,8 +377,9 @@ type EphemeralGarbageCollector struct {
 	// was superseded by a Cancel or reschedule can be recognised and dropped.
 	gen uint64
 
-	deleteCh chan pendingDeletion
-	cancelCh chan struct{}
+	deleteCh  chan pendingDeletion
+	cancelCh  chan struct{}
+	closeOnce sync.Once
 }
 
 // ephemeralTimer pairs a node's pending-deletion timer with a done channel
@@ -410,7 +411,7 @@ func NewEphemeralGarbageCollector(deleteFunc func(types.NodeID)) *EphemeralGarba
 	}
 }
 
-// Close stops the garbage collector.
+// Close stops the garbage collector. It is safe to call more than once.
 func (e *EphemeralGarbageCollector) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -421,7 +422,7 @@ func (e *EphemeralGarbageCollector) Close() {
 	}
 
 	// Close the cancel channel to signal all goroutines to exit
-	close(e.cancelCh)
+	e.closeOnce.Do(func() { close(e.cancelCh) })
 }
 
 // Schedule schedules a node for deletion after the expiry duration.
