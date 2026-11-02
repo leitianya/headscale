@@ -1032,6 +1032,45 @@ jobs:
             USE_PRESELECTED_VERSIONS=true
             echo "非 none 源码模式：复用前期精准版本；自动发现仅查找镜像地址。"
           fi
+          # 非 none 的 GitHub 源先用前期精准版本探测同名镜像。
+          # 只要同名 GHCR 或 Docker Hub 镜像命中任一精准版本，就直接生成候选源映射并结束自动发现；
+          # 只有两个同名候选源对所有精准版本都未命中，才执行后面的源码扫描与 Packages 枚举。
+          if [ "${SOURCE_KIND}" = "github" ] && [ "${USE_PRESELECTED_VERSIONS}" = true ] && [ "${SELECTED_COUNT:-0}" -gt 0 ]; then
+            DIRECT_OWNER="${SOURCE_REPO%%/*}"
+            DIRECT_REPO="${SOURCE_REPO#*/}"
+            DIRECT_TARGET="$(printf '%s' "${DIRECT_REPO,,}" | sed 's/[^a-z0-9._-]/-/g; s/^[._-]*//; s/[._-]*$//')"
+            DIRECT_SOURCES=()
+            mapfile -t DIRECT_TAGS < <(jq -r '.[].tagName | select(. != null and . != "" and . != "__mapping_tag__")' <<<"${SELECTED_JSON}")
+            for direct_image in "ghcr.io/${DIRECT_OWNER,,}/${DIRECT_REPO,,}" "docker.io/${DIRECT_OWNER,,}/${DIRECT_REPO,,}"; do
+              direct_hit=false
+              for selected_tag in "${DIRECT_TAGS[@]}"; do
+                DIRECT_CANDIDATES=("${selected_tag}")
+                if [[ "${selected_tag}" == v* ]]; then
+                  DIRECT_CANDIDATES+=("${selected_tag#v}")
+                else
+                  DIRECT_CANDIDATES+=("v${selected_tag}")
+                fi
+                for direct_tag in "${DIRECT_CANDIDATES[@]}"; do
+                  if crane manifest "${direct_image}:${direct_tag}" >/dev/null 2>&1; then
+                    direct_hit=true
+                    echo "同名镜像精准版本命中：${direct_image}:${direct_tag}"
+                    break 2
+                  fi
+                done
+              done
+              if [ "${direct_hit}" = true ]; then DIRECT_SOURCES+=("${direct_image}"); fi
+            done
+            if [ "${#DIRECT_SOURCES[@]}" -gt 0 ]; then
+              DIRECT_JOINED="$(IFS=,; echo "${DIRECT_SOURCES[*]}")"
+              printf '%s\t%s\t%s\t%s\n' "${DIRECT_JOINED}" "${DIRECT_TARGET}" '__no_package_tags__' '' > "${OUT}"
+              echo "同名镜像已存在，直接复用前期精准版本；跳过源码镜像扫描及 GitHub Packages 枚举。"
+              echo "自动发现映射：${DIRECT_JOINED} -> ${DIRECT_TARGET}"
+              echo "map_file=${OUT}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "同名 GHCR 与 Docker Hub 镜像对前期精准版本均未命中，继续执行原有源码扫描与 GitHub Packages 枚举。"
+          fi
+
           if [ "${SOURCE_KIND}" = "github" ]; then
             gh api -H 'Accept: application/vnd.github+json' "repos/${SOURCE_REPO}/tarball" > "${WORK}/source.tar.gz"
             mkdir -p "${SRC_DIR}"; tar -xzf "${WORK}/source.tar.gz" -C "${SRC_DIR}" --strip-components=1
@@ -1423,8 +1462,7 @@ jobs:
               [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 没有独立 Tag，也没有公共 tag/tag_list"; FAIL=$((FAIL+1)); continue; }
               echo "候选源 ${source_image} 使用 Release/clean_snapshot 或公共版本列表。"
             fi
-            # 读取镜像实际运行平台。多架构索引读取 manifests；单架构镜像回退读取 config。
-            # unknown/unknown 是 SBOM、provenance 或 attestation，不作为可运行平台参与比较。
+            # 读取镜像实际运行平台；unknown/unknown 的 SBOM、provenance、attestation 不参与比较。
             image_platforms() {
               local image_ref="$1" manifest_file config_file
               manifest_file="$(mktemp)"; config_file="$(mktemp)"
@@ -1433,10 +1471,8 @@ jobs:
               fi
               if jq -e '.manifests | type == "array"' "${manifest_file}" >/dev/null 2>&1; then
                 jq -r '.manifests[]? | select(.platform.os != null and .platform.architecture != null) | select(.platform.os != "unknown" and .platform.architecture != "unknown") | .platform.os + "/" + .platform.architecture + (if (.platform.variant // "") != "" then "/" + .platform.variant else "" end)' "${manifest_file}" | sort -u
-              else
-                if crane config "${image_ref}" > "${config_file}" 2>/dev/null; then
-                  jq -r 'select(.os != null and .architecture != null) | .os + "/" + .architecture + (if (.variant // "") != "" then "/" + .variant else "" end)' "${config_file}" | sort -u
-                fi
+              elif crane config "${image_ref}" > "${config_file}" 2>/dev/null; then
+                jq -r 'select(.os != null and .architecture != null) | .os + "/" + .architecture + (if (.variant // "") != "" then "/" + .variant else "" end)' "${config_file}" | sort -u
               fi
               rm -f "${manifest_file}" "${config_file}"
             }
