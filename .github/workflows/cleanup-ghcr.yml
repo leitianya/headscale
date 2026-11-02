@@ -12,10 +12,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 删除无标签版本
+      - name: 删除无标签镜像版本
         uses: actions/delete-package-versions@v5
         with:
           package-name: headscale
           package-type: container
           delete-only-untagged-versions: "true"
           min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
