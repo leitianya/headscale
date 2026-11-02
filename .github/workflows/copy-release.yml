@@ -1024,6 +1024,14 @@ jobs:
           COMPOSE_OUT="${RUNNER_TEMP}/compose-image-mappings.tsv"; PACKAGE_OUT="${RUNNER_TEMP}/package-image-mappings.tsv"
           trap 'rm -rf "${WORK}"' EXIT
           :>"${COMPOSE_OUT}"; :>"${PACKAGE_OUT}"
+          # src_repo 非 none 时，版本已在 prepare 阶段精准筛选完成。
+          # 自动发现阶段只发现镜像地址，不再实际执行 Package 全标签枚举；
+          # 原有枚举代码完整保留在兼容分支中，避免改变 none/旧逻辑能力。
+          USE_PRESELECTED_VERSIONS=false
+          if [ "${SOURCE_REPO}" != "none" ]; then
+            USE_PRESELECTED_VERSIONS=true
+            echo "非 none 源码模式：复用前期精准版本；自动发现仅查找镜像地址。"
+          fi
           if [ "${SOURCE_KIND}" = "github" ]; then
             gh api -H 'Accept: application/vnd.github+json' "repos/${SOURCE_REPO}/tarball" > "${WORK}/source.tar.gz"
             mkdir -p "${SRC_DIR}"; tar -xzf "${WORK}/source.tar.gz" -C "${SRC_DIR}" --strip-components=1
@@ -1142,6 +1150,7 @@ jobs:
               fi
               for page in $(seq 1 50); do
                 [ -n "${PACKAGE_PAGE_BASE}" ] || break
+                BEFORE_COUNT="$(sort -u "${WEB_PACKAGES}" | sed '/^$/d' | wc -l | xargs)"
                 if [[ "${PACKAGE_PAGE_BASE}" == "https://github.com/${OWNER}" ]]; then
                   PAGE_URL="${PACKAGE_PAGE_BASE}?tab=packages&repo_name=${REPO_NAME}&page=${page}"
                 else
@@ -1153,8 +1162,12 @@ jobs:
                 HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
                   python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/(?:users|orgs)/{re.escape(owner)}/packages/container/(?:package/)?([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
                   >> "${WEB_PACKAGES}"
-                COUNT="$(sort -u "${WEB_PACKAGES}" | wc -l | xargs)"
+                COUNT="$(sort -u "${WEB_PACKAGES}" | sed '/^$/d' | wc -l | xargs)"
                 echo "Packages 网页第 ${page} 页，累计发现 ${COUNT} 个包。"
+                if [ "${COUNT}" -eq "${BEFORE_COUNT}" ]; then
+                  echo "Packages 网页本页没有新增包，停止继续翻页。"
+                  break
+                fi
                 grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
               done
               sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
@@ -1163,14 +1176,19 @@ jobs:
                 while IFS= read -r NAME; do
                   [ -n "${NAME}" ] || continue
                   SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
-                  TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
-                  if [ -z "${TAGS}" ]; then
-                    # 页面顶部会明确显示 latest；crane ls 被限流时仍先保留 latest。
-                    TAGS="latest"
-                    echo "::warning::无法列出 ${SOURCE_IMAGE} 的标签，回退尝试 latest。"
+                  if [ "${USE_PRESELECTED_VERSIONS}" = true ]; then
+                    printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "__no_package_tags__" >> "${PACKAGE_OUT}"
+                    echo "网页发现 GitHub Package：${SOURCE_IMAGE}；复用前期精准版本，不再枚举 Package 全部标签。"
+                  else
+                    TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
+                    if [ -z "${TAGS}" ]; then
+                      # 页面顶部会明确显示 latest；crane ls 被限流时仍先保留 latest。
+                      TAGS="latest"
+                      echo "::warning::无法列出 ${SOURCE_IMAGE} 的标签，回退尝试 latest。"
+                    fi
+                    printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
+                    echo "网页发现 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
                   fi
-                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
-                  echo "网页发现 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
                 done < "${WEB_PACKAGES}"
               fi
             fi
@@ -1216,6 +1234,13 @@ jobs:
               while IFS= read -r package; do
                 [ -n "${package}" ] || continue
                 NAME="$(jq -r '.name' <<<"${package}")"
+                if [ "${USE_PRESELECTED_VERSIONS}" = true ]; then
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                  TARGET_NAME="${NAME,,}"
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${TARGET_NAME}" "__no_package_tags__" >> "${PACKAGE_OUT}"
+                  echo "发现关联 GitHub Package：${SOURCE_IMAGE}；复用前期精准版本，不再枚举 Package 全部标签。"
+                  continue
+                fi
                 ENCODED="$(jq -rn --arg v "${NAME}" '$v|@uri')"
                 VERSIONS_OK=false
                 if gh api --paginate --slurp "${PKG_ENDPOINT}/container/${ENCODED}/versions?per_page=100" > "${WORK}/versions.json" 2>/dev/null; then
@@ -1386,10 +1411,10 @@ jobs:
             if [ -n "${mapping_tag:-}" ]; then
               printf '%s\n' "${mapping_tag}" > "${TAG_FILE}"
               echo "候选源 ${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
-            elif [ "${TAG_SYNC_MODE}" = 'clean_snapshot' ]; then
+            elif [ "${SOURCE_REPO}" != 'none' ]; then
               jq -r '.[].tagName | select(. != "__mapping_tag__")' "${VERSIONS}" > "${TAG_FILE}"
-              [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 在 clean_snapshot 模式下没有选中的精准版本"; FAIL=$((FAIL+1)); continue; }
-              echo "候选源 ${source_image} 随 clean_snapshot 使用已筛选精准版本，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
+              [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 在非 none 源码模式下没有前期已选精准版本"; FAIL=$((FAIL+1)); continue; }
+              echo "候选源 ${source_image} 使用前期已筛选精准版本，共 $(wc -l < "${TAG_FILE}" | xargs) 个；不再枚举 Package 全部标签。"
             elif [ -n "${package_tags:-}" ] && [ "${package_tags}" != '__no_package_tags__' ]; then
               printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
               echo "候选源 ${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
@@ -1398,6 +1423,42 @@ jobs:
               [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 没有独立 Tag，也没有公共 tag/tag_list"; FAIL=$((FAIL+1)); continue; }
               echo "候选源 ${source_image} 使用 Release/clean_snapshot 或公共版本列表。"
             fi
+            # 读取镜像实际运行平台。多架构索引读取 manifests；单架构镜像回退读取 config。
+            # unknown/unknown 是 SBOM、provenance 或 attestation，不作为可运行平台参与比较。
+            image_platforms() {
+              local image_ref="$1" manifest_file config_file
+              manifest_file="$(mktemp)"; config_file="$(mktemp)"
+              if ! crane manifest --platform=all "${image_ref}" > "${manifest_file}" 2>/dev/null; then
+                rm -f "${manifest_file}" "${config_file}"; return 1
+              fi
+              if jq -e '.manifests | type == "array"' "${manifest_file}" >/dev/null 2>&1; then
+                jq -r '.manifests[]? | select(.platform.os != null and .platform.architecture != null) | select(.platform.os != "unknown" and .platform.architecture != "unknown") | .platform.os + "/" + .platform.architecture + (if (.platform.variant // "") != "" then "/" + .platform.variant else "" end)' "${manifest_file}" | sort -u
+              else
+                if crane config "${image_ref}" > "${config_file}" 2>/dev/null; then
+                  jq -r 'select(.os != null and .architecture != null) | .os + "/" + .architecture + (if (.variant // "") != "" then "/" + .variant else "" end)' "${config_file}" | sort -u
+                fi
+              fi
+              rm -f "${manifest_file}" "${config_file}"
+            }
+
+            same_runtime_platforms() {
+              local source_ref_to_check="$1" target_ref_to_check="$2" source_platforms target_platforms
+              source_platforms="$(image_platforms "${source_ref_to_check}" || true)"
+              target_platforms="$(image_platforms "${target_ref_to_check}" || true)"
+              if [ -z "${source_platforms}" ] || [ -z "${target_platforms}" ]; then
+                echo "::warning::无法完整读取运行平台，不允许按已存在跳过：${source_ref_to_check} -> ${target_ref_to_check}"
+                return 1
+              fi
+              if [ "${source_platforms}" != "${target_platforms}" ]; then
+                echo "::warning::源目标运行平台不一致，将重新复制修复：${target_ref_to_check}"
+                echo "源运行平台："; printf '%s\n' "${source_platforms}"
+                echo "目标运行平台："; printf '%s\n' "${target_platforms}"
+                return 1
+              fi
+              echo "运行平台一致：$(printf '%s' "${source_platforms}" | paste -sd ',' -)"
+              return 0
+            }
+
             while IFS= read -r release_tag; do
               [ -n "${release_tag}" ] || continue
               target_ref="${target_image}:${release_tag}"
@@ -1435,18 +1496,57 @@ jobs:
               fi
               if [ "${SKIP_EXISTING}" = true ]; then
                 TARGET_PROBE_FILE="${RUNNER_TEMP}/crane-target-probe.txt"
+                SOURCE_DIGEST_FILE="${RUNNER_TEMP}/crane-source-digest.txt"
+                TARGET_DIGEST_FILE="${RUNNER_TEMP}/crane-target-digest.txt"
+                TARGET_VALIDATE_FILE="${RUNNER_TEMP}/crane-target-validate.txt"
+                source_digest=""; target_digest=""; target_manifest_exists=false; target_complete=false
+
+                # 保留原有目标 Manifest 存在性检查，但不再仅凭“能读取 Manifest”就跳过。
                 if crane manifest "${target_ref}" > /dev/null 2>"${TARGET_PROBE_FILE}"; then
-                  echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"; last="${source_ref}"; SKIP=$((SKIP+1)); continue
+                  target_manifest_exists=true
+                else
+                  target_probe_message="$(tr '\n' ' ' < "${TARGET_PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                  if [ -n "${target_probe_message}" ] && ! printf '%s' "${target_probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                    echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
+                  fi
                 fi
-                target_probe_message="$(tr '\n' ' ' < "${TARGET_PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
-                if [ -n "${target_probe_message}" ] && ! printf '%s' "${target_probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
-                  echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
+
+                if [ "${target_manifest_exists}" = true ]; then
+                  if source_digest="$(crane digest "${source_ref}" 2>"${SOURCE_DIGEST_FILE}")"; then :; else
+                    source_digest=""
+                    source_digest_message="$(tr '\n' ' ' < "${SOURCE_DIGEST_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                    echo "::warning::无法读取源镜像 Digest，不允许直接跳过：${source_ref} | ${source_digest_message}"
+                  fi
+                  if target_digest="$(crane digest "${target_ref}" 2>"${TARGET_DIGEST_FILE}")"; then :; else
+                    target_digest=""
+                    target_digest_message="$(tr '\n' ' ' < "${TARGET_DIGEST_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                    echo "::warning::无法读取目标镜像 Digest，将重新复制：${target_ref} | ${target_digest_message}"
+                  fi
+                  if crane validate --remote "${target_ref}" > /dev/null 2>"${TARGET_VALIDATE_FILE}"; then
+                    target_complete=true
+                  else
+                    target_validate_message="$(tr '\n' ' ' < "${TARGET_VALIDATE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                    echo "::warning::目标镜像完整性验证失败，将重新复制修复：${target_ref} | ${target_validate_message}"
+                  fi
+
+                  if [ -n "${source_digest}" ] && [ -n "${target_digest}" ] && [ "${source_digest}" = "${target_digest}" ] && [ "${target_complete}" = true ] && same_runtime_platforms "${source_ref}" "${target_ref}"; then
+                    echo "跳过 ${target_ref}；源目标 Digest、完整性及运行平台均一致；latest 候选=${source_ref}" >> "${SUMMARY}"
+                    last="${source_ref}"; SKIP=$((SKIP+1)); continue
+                  fi
+
+                  if [ -n "${source_digest}" ] && [ -n "${target_digest}" ] && [ "${source_digest}" != "${target_digest}" ]; then
+                    echo "::warning::目标 Digest 与源不一致，将重新复制：${target_ref} | 源=${source_digest} | 目标=${target_digest}"
+                  elif [ "${target_complete}" != true ]; then
+                    echo "::warning::目标 Tag 可读取但镜像不完整，将重新复制：${target_ref}"
+                  else
+                    echo "::warning::目标镜像无法完成严格一致性确认，将重新复制：${target_ref}"
+                  fi
                 fi
               fi
               copy_ok=false
               COPY_FILE="${RUNNER_TEMP}/crane-copy-error.txt"
-              if crane copy --jobs=1 "${source_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
-                echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); copy_ok=true
+              if crane copy --platform=all --jobs=1 "${source_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2) && same_runtime_platforms "${source_ref}" "${target_ref}"; then
+                echo "成功 ${source_ref} -> ${target_ref}；多架构运行平台验证通过" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); copy_ok=true
               else
                 first_copy_error="$(tr '\n' ' ' < "${COPY_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
                 echo "::warning::首选源复制失败，将尝试同目标其他候选源：${source_ref} | ${first_copy_error}"
@@ -1457,8 +1557,8 @@ jobs:
                     [ "${fallback_ref}" != "${source_ref}" ] || continue
                     if ! crane manifest "${fallback_ref}" > /dev/null 2>"${PROBE_FILE}"; then continue; fi
                     echo "尝试备用候选源复制：${fallback_ref} -> ${target_ref}"
-                    if crane copy --jobs=1 "${fallback_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2); then
-                      echo "备用源成功 ${fallback_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${fallback_ref}"; OK=$((OK+1)); copy_ok=true; break 2
+                    if crane copy --platform=all --jobs=1 "${fallback_ref}" "${target_ref}" 2> >(tee "${COPY_FILE}" >&2) && same_runtime_platforms "${fallback_ref}" "${target_ref}"; then
+                      echo "备用源成功 ${fallback_ref} -> ${target_ref}；多架构运行平台验证通过" >> "${SUMMARY}"; last="${fallback_ref}"; OK=$((OK+1)); copy_ok=true; break 2
                     fi
                   done
                 done
@@ -1466,7 +1566,7 @@ jobs:
               fi
             done < "${TAG_FILE}"
             if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
-              if crane copy --jobs=1 "${last}" "${target_image}:latest"; then echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+              if crane copy --platform=all --jobs=1 "${last}" "${target_image}:latest" && same_runtime_platforms "${last}" "${target_image}:latest"; then echo "latest 更新成功且运行平台完整：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败或运行平台不完整：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
             fi
           done < "${MAP}"
           echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"; cat "${SUMMARY}"
