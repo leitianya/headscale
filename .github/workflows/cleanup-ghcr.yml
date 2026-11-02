@@ -1,0 +1,21 @@
+name: 清理Headscale无标签镜像
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 删除无标签版本
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
