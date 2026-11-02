@@ -1,7 +1,53 @@
-name: 清理Headscale无标签镜像
+name: 分批清理 GHCR 容器包
 
 on:
   workflow_dispatch:
+    inputs:
+      package_owner:
+        description: "Package所有者，例如 leitianya"
+        required: true
+        default: "leitianya"
+        type: string
+
+      package_name:
+        description: "要清理的Package名称，例如 headscale"
+        required: true
+        default: "headscale"
+        type: string
+
+      delete_mode:
+        description: "选择清理类型"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - untagged
+          - tag-prefix
+          - both
+
+      tag_prefix:
+        description: "标签开头，例如 sha-、dev-、test-"
+        required: false
+        default: "sha-"
+        type: string
+
+      batch_count:
+        description: "执行多少批，默认5批，范围1至50"
+        required: true
+        default: "5"
+        type: string
+
+      batch_size:
+        description: "每批最多删除多少个，默认100，范围1至100"
+        required: true
+        default: "100"
+        type: string
+
+      dry_run:
+        description: "仅预览，不真正删除"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -9,95 +55,354 @@ permissions:
 
 jobs:
   cleanup:
+    name: 分批清理 GHCR
     runs-on: ubuntu-latest
 
     steps:
-      - name: 清理无标签版本 第1批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 分析并分批清理
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_OWNER: ${{ inputs.package_owner }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          DELETE_MODE: ${{ inputs.delete_mode }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          BATCH_COUNT: ${{ inputs.batch_count }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      - name: 清理无标签版本 第2批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          echo "============================================================"
+          echo "GHCR容器包分批清理"
+          echo "Package所有者：${PACKAGE_OWNER}"
+          echo "Package名称：${PACKAGE_NAME}"
+          echo "完整镜像地址：ghcr.io/${PACKAGE_OWNER}/${PACKAGE_NAME}"
+          echo "清理模式：${DELETE_MODE}"
+          echo "标签前缀：${TAG_PREFIX}"
+          echo "批次数量：${BATCH_COUNT}"
+          echo "每批数量：${BATCH_SIZE}"
+          echo "仅预览：${DRY_RUN}"
+          echo "============================================================"
 
-      - name: 清理无标签版本 第3批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          if [ -z "$PACKAGE_OWNER" ]; then
+            echo "[错误] Package所有者不能为空。"
+            exit 1
+          fi
 
-      - name: 清理无标签版本 第4批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          if [ -z "$PACKAGE_NAME" ]; then
+            echo "[错误] Package名称不能为空。"
+            exit 1
+          fi
 
-      - name: 清理无标签版本 第5批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          case "$DELETE_MODE" in
+            untagged|tag-prefix|both)
+              ;;
+            *)
+              echo "[错误] 不支持的清理模式：$DELETE_MODE"
+              exit 1
+              ;;
+          esac
 
-      - name: 清理无标签版本 第6批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          case "$BATCH_COUNT" in
+            ''|*[!0-9]*)
+              echo "[错误] 批次数量必须是正整数。"
+              exit 1
+              ;;
+          esac
 
-      - name: 清理无标签版本 第7批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          if [ "$BATCH_COUNT" -lt 1 ] ||
+             [ "$BATCH_COUNT" -gt 50 ]; then
+            echo "[错误] 批次数量必须在1至50之间。"
+            exit 1
+          fi
 
-      - name: 清理无标签版本 第8批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          case "$BATCH_SIZE" in
+            ''|*[!0-9]*)
+              echo "[错误] 每批数量必须是正整数。"
+              exit 1
+              ;;
+          esac
 
-      - name: 清理无标签版本 第9批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          if [ "$BATCH_SIZE" -lt 1 ] ||
+             [ "$BATCH_SIZE" -gt 100 ]; then
+            echo "[错误] 每批数量必须在1至100之间。"
+            exit 1
+          fi
 
-      - name: 清理无标签版本 第10批
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: headscale
-          package-type: container
-          delete-only-untagged-versions: "true"
-          min-versions-to-keep: "0"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          if [ "$DELETE_MODE" = "tag-prefix" ] ||
+             [ "$DELETE_MODE" = "both" ]; then
+            if [ -z "$TAG_PREFIX" ]; then
+              echo "[错误] 清理指定标签开头时，标签前缀不能为空。"
+              exit 1
+            fi
+          fi
+
+          case "$DRY_RUN" in
+            true|false)
+              ;;
+            *)
+              echo "[错误] dry_run必须为true或false。"
+              exit 1
+              ;;
+          esac
+
+          TMP_ROOT="$(mktemp -d)"
+
+          cleanup_temp_files() {
+            rm -rf "$TMP_ROOT"
+          }
+
+          trap cleanup_temp_files EXIT
+
+          ENCODED_PACKAGE="$(
+            printf '%s' "$PACKAGE_NAME" |
+            sed 's#/#%2F#g'
+          )"
+
+          API_BASE="/users/${PACKAGE_OWNER}/packages/container/${ENCODED_PACKAGE}/versions"
+
+          echo
+          echo "===== 验证Package是否存在且当前令牌可读取 ====="
+
+          if ! gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${API_BASE}?per_page=1" \
+            >/dev/null; then
+            echo "[错误] 无法读取Package。"
+            echo
+            echo "请检查："
+            echo "1. Package所有者是否正确：${PACKAGE_OWNER}"
+            echo "2. Package名称是否正确：${PACKAGE_NAME}"
+            echo "3. 当前仓库是否在Package Settings中拥有Admin权限"
+            echo "4. 工作流是否设置packages: write"
+            exit 1
+          fi
+
+          echo "[完成] Package读取检查通过。"
+
+          TOTAL_SELECTED=0
+          TOTAL_DELETED=0
+          TOTAL_FAILED=0
+          COMPLETED_BATCHES=0
+
+          get_all_versions() {
+            local output_file="$1"
+
+            gh api --paginate \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${API_BASE}?per_page=100" \
+              --slurp > "$output_file"
+          }
+
+          create_candidate_list() {
+            local versions_file="$1"
+            local candidates_file="$2"
+
+            jq \
+              --arg mode "$DELETE_MODE" \
+              --arg prefix "$TAG_PREFIX" \
+              --argjson limit "$BATCH_SIZE" \
+              '
+              def tags:
+                (.metadata.container.tags // []);
+
+              def is_untagged:
+                (tags | length) == 0;
+
+              def is_prefix_only:
+                (tags | length) > 0
+                and all(tags[]; startswith($prefix));
+
+              [
+                flatten[]
+                | select(
+                    if $mode == "untagged" then
+                      is_untagged
+                    elif $mode == "tag-prefix" then
+                      is_prefix_only
+                    elif $mode == "both" then
+                      (is_untagged or is_prefix_only)
+                    else
+                      false
+                    end
+                  )
+              ]
+              | sort_by(.created_at)
+              | .[0:$limit]
+              | .[]
+              | [
+                  (.id | tostring),
+                  .created_at,
+                  .name,
+                  (
+                    if (tags | length) == 0
+                    then "Untagged"
+                    else (tags | join(","))
+                    end
+                  )
+                ]
+              | @tsv
+              ' \
+              -r "$versions_file" > "$candidates_file"
+          }
+
+          for BATCH_NUMBER in $(seq 1 "$BATCH_COUNT")
+          do
+            echo
+            echo "============================================================"
+            echo "处理第 ${BATCH_NUMBER}/${BATCH_COUNT} 批"
+            echo "Package：ghcr.io/${PACKAGE_OWNER}/${PACKAGE_NAME}"
+            echo "============================================================"
+
+            VERSIONS_FILE="${TMP_ROOT}/versions-${BATCH_NUMBER}.json"
+            DELETE_LIST="${TMP_ROOT}/delete-${BATCH_NUMBER}.tsv"
+
+            echo "[信息] 获取当前Package全部版本……"
+
+            get_all_versions "$VERSIONS_FILE"
+
+            CURRENT_TOTAL="$(
+              jq '[flatten[]] | length' "$VERSIONS_FILE"
+            )"
+
+            CURRENT_TAGGED="$(
+              jq '
+                [
+                  flatten[]
+                  | select(
+                      (.metadata.container.tags // [])
+                      | length > 0
+                    )
+                ]
+                | length
+              ' "$VERSIONS_FILE"
+            )"
+
+            CURRENT_UNTAGGED="$(
+              jq '
+                [
+                  flatten[]
+                  | select(
+                      (.metadata.container.tags // [])
+                      | length == 0
+                    )
+                ]
+                | length
+              ' "$VERSIONS_FILE"
+            )"
+
+            echo "[信息] 当前版本总数：${CURRENT_TOTAL}"
+            echo "[信息] 当前有标签版本：${CURRENT_TAGGED}"
+            echo "[信息] 当前无标签版本：${CURRENT_UNTAGGED}"
+
+            create_candidate_list \
+              "$VERSIONS_FILE" \
+              "$DELETE_LIST"
+
+            SELECTED_COUNT="$(
+              wc -l < "$DELETE_LIST" |
+              tr -d " "
+            )"
+
+            echo "[信息] 本批符合清理条件：${SELECTED_COUNT}"
+
+            if [ "$SELECTED_COUNT" -eq 0 ]; then
+              echo "[完成] 已没有符合当前条件的版本。"
+              break
+            fi
+
+            TOTAL_SELECTED=$((TOTAL_SELECTED + SELECTED_COUNT))
+            COMPLETED_BATCHES=$((COMPLETED_BATCHES + 1))
+
+            echo
+            echo "===== 第 ${BATCH_NUMBER} 批处理列表 ====="
+
+            while IFS=$'\t' read -r VERSION_ID CREATED_AT VERSION_NAME TAGS
+            do
+              echo "------------------------------------------------------------"
+              echo "版本ID：${VERSION_ID}"
+              echo "创建时间：${CREATED_AT}"
+              echo "Digest或版本名：${VERSION_NAME}"
+              echo "标签：${TAGS}"
+            done < "$DELETE_LIST"
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo
+              echo "[预览] 第${BATCH_NUMBER}批不会真正删除。"
+              continue
+            fi
+
+            echo
+            echo "===== 开始删除第 ${BATCH_NUMBER} 批 ====="
+
+            BATCH_DELETED=0
+            BATCH_FAILED=0
+
+            while IFS=$'\t' read -r VERSION_ID CREATED_AT VERSION_NAME TAGS
+            do
+              [ -n "$VERSION_ID" ] || continue
+
+              echo
+              echo "[删除] ID=${VERSION_ID}"
+              echo "创建时间=${CREATED_AT}"
+              echo "版本=${VERSION_NAME}"
+              echo "标签=${TAGS}"
+
+              if gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "${API_BASE}/${VERSION_ID}"
+              then
+                echo "[完成] 删除成功：${VERSION_ID}"
+
+                BATCH_DELETED=$((BATCH_DELETED + 1))
+                TOTAL_DELETED=$((TOTAL_DELETED + 1))
+              else
+                echo "[警告] 删除失败：${VERSION_ID}"
+
+                BATCH_FAILED=$((BATCH_FAILED + 1))
+                TOTAL_FAILED=$((TOTAL_FAILED + 1))
+              fi
+            done < "$DELETE_LIST"
+
+            echo
+            echo "第${BATCH_NUMBER}批结果："
+            echo "成功删除：${BATCH_DELETED}"
+            echo "删除失败：${BATCH_FAILED}"
+
+            if [ "$BATCH_FAILED" -gt 0 ]; then
+              echo "[警告] 本批存在删除失败，停止后续批次。"
+              break
+            fi
+
+            sleep 2
+          done
+
+          echo
+          echo "============================================================"
+          echo "全部批次处理结束"
+          echo "Package：ghcr.io/${PACKAGE_OWNER}/${PACKAGE_NAME}"
+          echo "清理模式：${DELETE_MODE}"
+          echo "标签前缀：${TAG_PREFIX}"
+          echo "计划批次：${BATCH_COUNT}"
+          echo "实际处理批次：${COMPLETED_BATCHES}"
+          echo "每批上限：${BATCH_SIZE}"
+          echo "选中总数：${TOTAL_SELECTED}"
+          echo "成功删除：${TOTAL_DELETED}"
+          echo "删除失败：${TOTAL_FAILED}"
+          echo "仅预览：${DRY_RUN}"
+          echo "============================================================"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo
+            echo "[预览完成] 没有实际删除任何Package版本。"
+            echo "确认列表正确后，请重新运行并取消“仅预览”。"
+          fi
+
+          if [ "$TOTAL_FAILED" -gt 0 ]; then
+            exit 1
+          fi
