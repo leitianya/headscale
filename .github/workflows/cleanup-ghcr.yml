@@ -12,7 +12,88 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 删除无标签镜像版本
+      - name: 清理无标签版本 第1批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第2批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第3批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第4批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第5批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第6批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第7批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第8批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第9批
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: headscale
+          package-type: container
+          delete-only-untagged-versions: "true"
+          min-versions-to-keep: "0"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理无标签版本 第10批
         uses: actions/delete-package-versions@v5
         with:
           package-name: headscale
