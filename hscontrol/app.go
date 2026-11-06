@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -49,6 +51,7 @@ import (
 	"github.com/sasha-s/go-deadlock"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/envknob"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
@@ -57,6 +60,7 @@ import (
 
 var (
 	errSTUNAddressNotSet                   = errors.New("STUN address not set")
+	errTLSCertificateNotValidNow           = errors.New("TLS certificate is not valid now")
 	errUnsupportedLetsEncryptChallengeType = errors.New(
 		"unknown value for Lets Encrypt challenge type",
 	)
@@ -169,14 +173,6 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 			return
 		}
 
-		// Re-registering with a permanent key cancels nothing, and the poll
-		// path only cancels for ephemeral nodes, so the old timer still fires.
-		if !node.IsEphemeral() {
-			log.Debug().Caller().EmbedObject(node).Msg("node is no longer ephemeral, skipping garbage collection")
-
-			return
-		}
-
 		// Schedule and Cancel run outside the session transition, so a
 		// disconnecting session can arm a timer after a reconnect already
 		// cancelled it. The session count is authoritative; a stale timer
@@ -187,6 +183,15 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		// delete-if-idle in State if that edge matters.
 		if node.ActiveSessions() > 0 {
 			log.Debug().Caller().EmbedObject(node).Msg("ephemeral node has a live session, skipping garbage collection")
+
+			return
+		}
+
+		// A user claiming a tagged node can clear its ephemeral flag after
+		// the timer is armed.
+		if !node.IsEphemeral() {
+			log.Debug().Caller().EmbedObject(node).
+				Msg("node is no longer ephemeral, skipping garbage collection")
 
 			return
 		}
@@ -230,16 +235,23 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	app.authProvider = authProvider
 
 	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
+		// Clients route reverse lookups for the Tailscale ranges themselves
+		// (magicDNSRootDomains in tailscale.com/ipn/ipnlocal) and SaaS sends
+		// no reverse routes, so only a prefix outside those ranges needs them.
+		outside := func(p, r netip.Prefix) bool {
+			return p.Bits() < r.Bits() || !r.Contains(p.Addr())
+		}
+
 		// TODO(kradalby): revisit why this takes a list.
 		var magicDNSDomains []dnsname.FQDN
-		if cfg.PrefixV4 != nil {
+		if cfg.PrefixV4 != nil && outside(*cfg.PrefixV4, tsaddr.CGNATRange()) {
 			magicDNSDomains = append(
 				magicDNSDomains,
 				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...,
 			)
 		}
 
-		if cfg.PrefixV6 != nil {
+		if cfg.PrefixV6 != nil && outside(*cfg.PrefixV6, tsaddr.TailscaleULARange()) {
 			magicDNSDomains = append(
 				magicDNSDomains,
 				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...,
@@ -442,6 +454,7 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			}
 
 			h.cfg.SetExtraRecords(records)
+			h.state.WarnNodesHoldingExtraRecords()
 
 			h.Change(change.ExtraRecords())
 
@@ -645,6 +658,9 @@ func (h *Headscale) Serve() error {
 		defer h.extraRecordMan.Close()
 	}
 
+	// Covers the records from the config too.
+	h.state.WarnNodesHoldingExtraRecords()
+
 	// Start all scheduled tasks, e.g. expiring nodes, derp updates and
 	// records updates
 	scheduleCtx, scheduleCancel := context.WithCancel(context.Background())
@@ -701,9 +717,10 @@ func (h *Headscale) Serve() error {
 	// manage OAuth clients through the same v2 keys handler the Tailscale
 	// ecosystem uses.
 	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
-		State:  h.state,
-		Change: h.Change,
-		Cfg:    h.cfg,
+		State:     h.state,
+		Change:    h.Change,
+		Cfg:       h.cfg,
+		Connected: h.isConnected,
 	})
 
 	// Serve both Huma APIs over the unix socket without TLS or auth: socket
@@ -896,11 +913,20 @@ func (h *Headscale) Serve() error {
 			case syscall.SIGHUP:
 				log.Info().
 					Str("signal", sig.String()).
-					Msg("Received SIGHUP, reloading ACL policy")
+					Msg("Received SIGHUP")
+
+				if tlsBundle.Reload != nil {
+					err := tlsBundle.Reload()
+					if err != nil {
+						log.Error().Err(err).Msg("reloading TLS certificate failed, still serving the previous one")
+					}
+				}
 
 				if h.cfg.Policy.IsEmpty() {
 					continue
 				}
+
+				log.Info().Msg("Reloading ACL policy")
 
 				changes, err := h.state.ReloadPolicy()
 				h.Change(changes...)
@@ -1051,6 +1077,10 @@ type tlsBundle struct {
 	Manage func(context.Context) error
 	// Stop ends certificate maintenance. Nil without ACME.
 	Stop func()
+	// Reload swaps in the certificate now on disk for new connections. On
+	// error the previous certificate keeps serving. Nil unless the
+	// certificate comes from tls.cert_path and tls.key_path.
+	Reload func() error
 }
 
 // acmeTrustedRoots verifies the ACME directory; nil means the system roots.
@@ -1194,19 +1224,59 @@ func (h *Headscale) getTLSSettings(ctx context.Context) (*tlsBundle, error) {
 		return &tlsBundle{}, nil
 	}
 
-	cert, err := tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("loading TLS keypair (tls.cert_path=%q, tls.key_path=%q): %w",
-			h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath, err)
+	load := func() (*tls.Certificate, error) {
+		cert, err := tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("loading TLS keypair (tls.cert_path=%q, tls.key_path=%q): %w",
+				h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath, err)
+		}
+
+		return &cert, nil
 	}
+
+	cert, err := load()
+	if err != nil {
+		return nil, err
+	}
+
+	var current atomic.Pointer[tls.Certificate]
+
+	current.Store(cert)
 
 	tlsConfig := &tls.Config{
-		NextProtos:   []string{"http/1.1"},
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		// Not Certificates: crypto/tls prefers those when a client sends no
+		// SNI, so that client would never see a reload.
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return current.Load(), nil },
+		MinVersion:     tls.VersionTLS12,
 	}
 
-	return &tlsBundle{Config: tlsConfig}, nil
+	reload := func() error {
+		cert, err := load()
+		if err != nil {
+			return err
+		}
+
+		// Loading does not check validity. Swapping in a certificate no client
+		// accepts would turn a bad deploy into an outage.
+		now, leaf := time.Now(), cert.Leaf
+		if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+			return fmt.Errorf("%w (tls.cert_path=%q): valid from %s until %s",
+				errTLSCertificateNotValidNow, h.cfg.TLS.CertPath,
+				leaf.NotBefore.Format(time.RFC3339), leaf.NotAfter.Format(time.RFC3339))
+		}
+
+		current.Store(cert)
+
+		log.Info().
+			Str("cert_path", h.cfg.TLS.CertPath).
+			Str("not_after", leaf.NotAfter.Format(time.RFC3339)).
+			Msg("TLS certificate reloaded")
+
+		return nil
+	}
+
+	return &tlsBundle{Config: tlsConfig, Reload: reload}, nil
 }
 
 // selfSignedTLSConfig returns a TLS config with a fresh in-memory certificate.
@@ -1311,9 +1381,10 @@ func (h *Headscale) HTTPHandler() http.Handler {
 	})
 
 	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
-		State:  h.state,
-		Change: h.Change,
-		Cfg:    h.cfg,
+		State:     h.state,
+		Change:    h.Change,
+		Cfg:       h.cfg,
+		Connected: h.isConnected,
 	})
 
 	return h.createRouter(humaMux, humaV2Mux)
@@ -1359,6 +1430,12 @@ func (h *Headscale) MapBatcher() *mapper.Batcher {
 	return h.mapBatcher
 }
 
+// isConnected reads mapBatcher on each call: tests build the HTTP handler
+// before they start the batcher.
+func (h *Headscale) isConnected(id types.NodeID) bool {
+	return h.mapBatcher.IsConnected(id)
+}
+
 // StartEphemeralGCForTest starts the ephemeral node garbage collector.
 // It registers a cleanup function on tb to stop the collector.
 // It panics when called outside of tests.
@@ -1378,8 +1455,8 @@ func (z *zerologRequestLogger) NewLogEntry(
 	r *http.Request,
 ) middleware.LogEntry {
 	return &zerologLogEntry{
-		method: r.Method,
-		path:   r.URL.Path,
+		method: clipForLog(r.Method),
+		path:   clipForLog(r.URL.Path),
 		proto:  r.Proto,
 		remote: r.RemoteAddr,
 	}
