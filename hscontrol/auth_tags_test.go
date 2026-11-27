@@ -17,29 +17,8 @@ import (
 func createTestAppWithNodeExpiry(t *testing.T, nodeExpiry time.Duration) *Headscale {
 	t.Helper()
 
-	tmpDir := t.TempDir()
-
-	cfg := types.Config{
-		ServerURL:           "http://localhost:8080",
-		NoisePrivateKeyPath: tmpDir + "/noise_private.key",
-		Node: types.NodeConfig{
-			Expiry: nodeExpiry,
-		},
-		Database: types.DatabaseConfig{
-			Type: "sqlite3",
-			Sqlite: types.SqliteConfig{
-				Path: tmpDir + "/headscale_test.db",
-			},
-		},
-		OIDC: types.OIDCConfig{},
-		Policy: types.PolicyConfig{
-			Mode: types.PolicyModeDB,
-		},
-		Tuning: types.Tuning{
-			BatchChangeDelay: 100 * time.Millisecond,
-			BatcherWorkers:   1,
-		},
-	}
+	cfg := validConfig(t)
+	cfg.Node.Expiry = nodeExpiry
 
 	app, err := NewHeadscale(&cfg)
 	require.NoError(t, err)
@@ -556,7 +535,7 @@ func TestTaggedPreAuthKeyDisablesKeyExpiry(t *testing.T) {
 
 	// Critical assertion: Tagged nodes should have expiry disabled
 	assert.True(t, node.IsTagged(), "Node should be tagged")
-	assert.False(t, node.Expiry().Valid(), "Tagged node should have expiry disabled (nil)")
+	assert.True(t, node.KeyExpiryDisabled(), "Tagged node should have key expiry off")
 }
 
 // TestUntaggedPreAuthKeyPreservesKeyExpiry tests that nodes registered with
@@ -640,7 +619,7 @@ func TestTaggedNodeReauthPreservesDisabledExpiry(t *testing.T) {
 	node, found := app.state.GetNodeByNodeKey(nodeKey.Public())
 	require.True(t, found)
 	require.True(t, node.IsTagged())
-	require.False(t, node.Expiry().Valid(), "Initial registration should have expiry disabled")
+	require.True(t, node.KeyExpiryDisabled(), "Initial registration should have key expiry off")
 
 	// Re-authenticate with a NEW expiry request (should be ignored for tagged nodes)
 	newRequestedExpiry := time.Now().Add(48 * time.Hour)
@@ -665,8 +644,8 @@ func TestTaggedNodeReauthPreservesDisabledExpiry(t *testing.T) {
 
 	// Critical assertion: Tagged node should preserve disabled expiry on re-auth
 	assert.True(t, nodeAfterReauth.IsTagged(), "Node should still be tagged")
-	assert.False(t, nodeAfterReauth.Expiry().Valid(),
-		"Tagged node should have expiry PRESERVED as disabled after re-auth")
+	assert.True(t, nodeAfterReauth.KeyExpiryDisabled(),
+		"Tagged node should keep key expiry off after re-auth")
 }
 
 // TestTaggedNodeRestartPreservesNilExpiry tests that a tagged node whose
@@ -878,8 +857,8 @@ func TestExpiryDuringPersonalToTaggedConversion(t *testing.T) {
 	require.True(t, nodeAfter.IsTagged(), "Node should be tagged after conversion")
 
 	// CRITICAL ASSERTION: Tagged nodes should NOT have expiry
-	assert.False(t, nodeAfter.Expiry().Valid(),
-		"Tagged node should have expiry cleared to nil")
+	assert.True(t, nodeAfter.KeyExpiryDisabled(),
+		"Tagged node should have key expiry off")
 }
 
 // TestExpiryDuringTaggedToPersonalConversion tests that when a tagged node
@@ -1109,8 +1088,8 @@ func TestTaggedAuthKeyIgnoresNodeExpiry(t *testing.T) {
 	require.True(t, found)
 
 	assert.True(t, node.IsTagged())
-	assert.False(t, node.Expiry().Valid(),
-		"tagged node should have expiry disabled (nil) even with node.expiry configured")
+	assert.True(t, node.KeyExpiryDisabled(),
+		"tagged node should have key expiry off even with node.expiry configured")
 }
 
 // TestNodeExpiryZeroDisablesDefault tests that setting node.expiry to 0

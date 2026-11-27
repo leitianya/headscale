@@ -41,6 +41,8 @@ repos:
         name: treefmt
         entry: nix fmt --
         language: system
+        # Parallel batches time out on treefmt's cache lock.
+        require_serial: true
         exclude: ^docs/
         types_or: [javascript, jsx, ts, tsx, yaml, json, html, css, scss, sass, markdown, nix]
 
@@ -58,6 +60,15 @@ repos:
         entry: nix develop --command -- golangci-lint run --new-from-rev=HEAD~1 --timeout=5m --fix
         language: system
         types: [go]
+        pass_filenames: false
+
+      # zizmor audits the whole tree at once: actions.lock and
+      # .github/zizmor.yml shape each file's findings.
+      - id: zizmor
+        name: zizmor
+        entry: nix develop --command -- zizmor --offline --no-progress .
+        language: system
+        files: ^(\.github/|\.pre-commit-config\.yaml$)
         pass_filenames: false
 
       # vendor-hash keeps flakehashes.json in sync with go.mod/go.sum.

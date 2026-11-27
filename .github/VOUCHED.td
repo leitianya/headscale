@@ -20,12 +20,14 @@ adoolaard
 adriangoransson
 aluxima
 alynxzhou
+andrewyager
 apollo13
 aradng
 arcticlampyrid
 arkie arkie
 arpitjain099
 bobelev
+c4software
 chibanglw
 christian-heusel
 cjstate

@@ -21,12 +21,13 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/spf13/viper"
 	"tailscale.com/tailcfg"
 )
 
 var (
 	errEmptyDERPMapFile = errors.New("DERP map file has no regions or homeparams")
+	errDERPMapStatus    = errors.New("unexpected HTTP status")
+	errDERPURLSyntax    = errors.New("invalid URL syntax")
 
 	ErrRegionIDKey    = errors.New("doesn't match its key")
 	ErrRegionNoNodes  = errors.New("must specify at least one node in DERP Region")
@@ -130,21 +131,26 @@ func loadDERPMapFromURL(addr url.URL) (*tailcfg.DERPMap, error) {
 
 	defer resp.Body.Close()
 
+	// An error page can be JSON that decodes to an empty map.
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DERP map %s: %w: %s", addr.Redacted(), errDERPMapStatus, resp.Status)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("DERP map %s: %w", addr.Redacted(), err)
 	}
 
 	var derpMap tailcfg.DERPMap
 
 	err = json.Unmarshal(body, &derpMap)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("DERP map %s: %w", addr.Redacted(), err)
 	}
 
 	err = validateRegions(&derpMap)
 	if err != nil {
-		return nil, fmt.Errorf("DERP map %s: %w", addr.String(), err)
+		return nil, fmt.Errorf("DERP map %s: %w", addr.Redacted(), err)
 	}
 
 	return &derpMap, nil
@@ -229,16 +235,35 @@ func ApplyPolicy(base, pol *tailcfg.DERPMap) *tailcfg.DERPMap {
 	return out
 }
 
-func GetDERPMap(cfg types.DERPConfig) (*tailcfg.DERPMap, error) {
-	var derpMaps []*tailcfg.DERPMap
+// GetDERPMap merges every configured DERP map source. A source that fails to
+// load is skipped rather than failing the rest, as a derp.urls server is often
+// a third party's: the map always holds what did load, and the error joins
+// every failure for the caller to judge. shuffleSeed orders DERP nodes the
+// same on every server of a tailnet.
+func GetDERPMap(cfg types.DERPConfig, shuffleSeed string) (*tailcfg.DERPMap, error) {
+	var (
+		derpMaps []*tailcfg.DERPMap
+		errs     []error
+	)
+
 	if cfg.DERPMap != nil {
 		derpMaps = append(derpMaps, cfg.DERPMap)
 	}
 
-	for _, addr := range cfg.URLs {
-		derpMap, err := loadDERPMapFromURL(addr)
+	for i, u := range cfg.URLs {
+		addr, err := url.Parse(string(u))
 		if err != nil {
-			return nil, err
+			// The parser's error quotes the URL or parts of it, credentials
+			// included.
+			errs = append(errs, fmt.Errorf("derp.urls[%d]: %w", i, errDERPURLSyntax))
+
+			continue
+		}
+
+		derpMap, err := loadDERPMapFromURL(*addr)
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
 
 		derpMaps = append(derpMaps, derpMap)
@@ -247,19 +272,20 @@ func GetDERPMap(cfg types.DERPConfig) (*tailcfg.DERPMap, error) {
 	for _, path := range cfg.Paths {
 		derpMap, err := loadDERPMapFromPath(path)
 		if err != nil {
-			return nil, err
+			errs = append(errs, err)
+			continue
 		}
 
 		derpMaps = append(derpMaps, derpMap)
 	}
 
 	derpMap := mergeDERPMaps(derpMaps)
-	shuffleDERPMap(derpMap)
+	shuffleDERPMap(derpMap, shuffleSeed)
 
-	return derpMap, nil
+	return derpMap, errors.Join(errs...)
 }
 
-func shuffleDERPMap(dm *tailcfg.DERPMap) {
+func shuffleDERPMap(dm *tailcfg.DERPMap, seed string) {
 	if dm == nil || len(dm.Regions) == 0 {
 		return
 	}
@@ -277,7 +303,7 @@ func shuffleDERPMap(dm *tailcfg.DERPMap) {
 	// A new generator per call gives the same input the same order. Clients
 	// close their home relay when its node order changes, so a refresh that
 	// finds no change must not reorder anything.
-	rng := rand.New(rand.NewSource(derpShuffleSeed())) //nolint:gosec // weak random is fine for DERP scrambling
+	rng := rand.New(rand.NewSource(derpShuffleSeed(seed))) //nolint:gosec // weak random is fine for DERP scrambling
 
 	for _, id := range ids {
 		region := dm.Regions[id]
@@ -297,12 +323,12 @@ var (
 	derpSeedMu  sync.Mutex
 )
 
-func derpShuffleSeed() int64 {
+func derpShuffleSeed(seed string) int64 {
 	derpSeedMu.Lock()
 	defer derpSeedMu.Unlock()
 
 	if !derpSeedSet {
-		seed := cmp.Or(viper.GetString("dns.base_domain"), time.Now().String())
+		seed = cmp.Or(seed, time.Now().String())
 		derpSeed = int64(crc64.Checksum([]byte(seed), crc64Table)) //nolint:gosec // only a seed, overflow is harmless
 		derpSeedSet = true
 	}

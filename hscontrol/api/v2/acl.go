@@ -16,7 +16,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/tailscale/hujson"
 )
 
@@ -126,19 +125,25 @@ func registerACL(api huma.API, b Backend) {
 			)
 		}
 
+		// Checked under the policy lock, so two writers holding the same ETag
+		// cannot both pass.
+		var match func(string) bool
 		if in.IfMatch != "" {
-			current, err := currentPolicy(b)
-			if err != nil {
-				return nil, err
-			}
+			match = func(stored string) bool {
+				if stored == "" {
+					stored = defaultPolicy
+				}
 
-			if !etagMatches(in.IfMatch, current) {
-				return nil, huma.Error412PreconditionFailed("precondition failed, invalid old hash")
+				return etagMatches(in.IfMatch, []byte(stored))
 			}
 		}
 
-		updated, cs, err := b.State.UpdatePolicy(in.RawBody)
+		updated, cs, err := b.State.UpdatePolicyIf(in.RawBody, match)
 		b.Change(cs...)
+
+		if errors.Is(err, state.ErrPolicyPrecondition) {
+			return nil, huma.Error412PreconditionFailed("precondition failed, invalid old hash")
+		}
 
 		if err != nil {
 			return nil, mapError("setting policy", err)
@@ -221,7 +226,7 @@ func currentPolicy(b Backend) ([]byte, error) {
 		return []byte(p.Data), nil
 
 	case types.PolicyModeFile:
-		path := util.AbsolutePathFromConfigPath(b.Cfg.Policy.Path)
+		path := b.Cfg.AbsPath(b.Cfg.Policy.Path)
 		if path == "" {
 			return []byte(defaultPolicy), nil
 		}

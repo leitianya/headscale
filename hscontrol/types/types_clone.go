@@ -105,6 +105,7 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	AuthKey            *Credential
 	Ephemeral          bool
 	Expiry             *time.Time
+	KeyExpiryDisabled  bool
 	LastSeen           *time.Time
 	ApprovedRoutes     Prefixes
 	AutoApprovedRoutes Prefixes
@@ -116,6 +117,7 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	ActiveSessions     int
 	SessionEpoch       uint64
 	SessionStart       time.Time
+	CapVer             tailcfg.CapabilityVersion
 }{})
 
 // Clone makes a deep copy of PreAuthKey.

@@ -186,6 +186,11 @@ type Node struct {
 
 	Expiry *time.Time
 
+	// KeyExpiryDisabled keeps the node from expiring while it is set; Expiry
+	// is kept, and counts again once it is cleared. Tailscale stores the two
+	// apart the same way.
+	KeyExpiryDisabled bool `gorm:"default:false"`
+
 	// LastSeen is when the node was last in contact with
 	// headscale. It is best effort and not persisted.
 	LastSeen *time.Time `gorm:"column:last_seen"`
@@ -234,6 +239,14 @@ type Node struct {
 	// overlapping reconnect keeps it. Primary election prefers the
 	// oldest. Runtime-only.
 	SessionStart time.Time `gorm:"-"`
+
+	// CapVer is the capability version from the node's latest MapRequest,
+	// sent to peers as [tailcfg.Node.Cap]. Clients gate peer protocol
+	// features on it (e.g. hybrid WireGuard handshakes), so peers must see
+	// the node's own version, never the viewer's. 0 until the node sends a
+	// MapRequest, which clients read as "nothing new supported".
+	// Runtime-only.
+	CapVer tailcfg.CapabilityVersion `gorm:"-"`
 }
 
 type Nodes []*Node
@@ -254,6 +267,10 @@ func (node *Node) IsExpired() bool {
 
 // IsExpiredAt reports whether the node registration has expired at now.
 func (node *Node) IsExpiredAt(now time.Time) bool {
+	if node.KeyExpiryDisabled {
+		return false
+	}
+
 	// If Expiry is not set, the client has not indicated that
 	// it wants an expiry time, it is therefore considered
 	// to mean "not expired"
@@ -920,7 +937,7 @@ func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
 		return "", false
 	}
 
-	fqdn, err := nv.GetFQDN(cfg.BaseDomain)
+	fqdn, err := nv.GetFQDN(cfg.DNSConfig.BaseDomain)
 	if err != nil {
 		return "", false
 	}
@@ -944,7 +961,7 @@ func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
 	// A node may publish only its own name's challenge, which keeps it from
 	// other names' certificates only where the provider answers each name's
 	// challenge apart.
-	if iso, ok := cfg.DNSChallenge.Provider.(hsdns.Isolator); ok && !iso.Isolates(domain) {
+	if iso, ok := cfg.DNSProvider().(hsdns.Isolator); ok && !iso.Isolates(domain) {
 		return "", false
 	}
 
@@ -1132,6 +1149,16 @@ func (nv NodeView) IsExpiredAt(now time.Time) bool {
 	}
 
 	return nv.ж.IsExpiredAt(now)
+}
+
+// KeyExpiry is the expiry clients are sent: none while expiry is disabled,
+// whatever time is kept for when it is enabled again.
+func (nv NodeView) KeyExpiry() (time.Time, bool) {
+	if !nv.Valid() || nv.KeyExpiryDisabled() {
+		return time.Time{}, false
+	}
+
+	return nv.Expiry().GetOk()
 }
 
 // Online reports the node's last known connectivity.
@@ -1340,29 +1367,6 @@ func (nv NodeView) HasPolicyChange(other NodeView) bool {
 	return false
 }
 
-// TailNodes converts a slice of [NodeView] values into Tailscale [tailcfg.Node] values.
-func TailNodes(
-	nodes views.Slice[NodeView],
-	capVer tailcfg.CapabilityVersion,
-	primaryRouteFunc RouteFunc,
-	cfg *Config,
-) ([]*tailcfg.Node, error) {
-	tNodes := make([]*tailcfg.Node, 0, nodes.Len())
-
-	for _, node := range nodes.All() {
-		// nil selfPolicyCaps: this batch builds peer views; the caller
-		// sets each peer's CapMap from [policyv2.PeerCapMap].
-		tNode, err := node.TailNode(capVer, primaryRouteFunc, cfg, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		tNodes = append(tNodes, tNode)
-	}
-
-	return tNodes, nil
-}
-
 // TailNode converts a [NodeView] into a Tailscale [tailcfg.Node].
 //
 // selfPolicyCaps is the per-node CapMap from [policy.PolicyManager.NodeCapMap]
@@ -1380,7 +1384,7 @@ func (nv NodeView) TailNode(
 		return nil, ErrInvalidNodeView
 	}
 
-	hostname, err := nv.GetFQDN(cfg.BaseDomain)
+	hostname, err := nv.GetFQDN(cfg.DNSConfig.BaseDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -1390,10 +1394,7 @@ func (nv NodeView) TailNode(
 		derp = nv.Hostinfo().NetInfo().PreferredDERP()
 	}
 
-	var keyExpiry time.Time
-	if nv.Expiry().Valid() {
-		keyExpiry = nv.Expiry().Get()
-	}
+	keyExpiry, _ := nv.KeyExpiry()
 
 	// Fail here, where the mapper drops just this peer, rather than in
 	// json.Marshal, which fails the whole response.

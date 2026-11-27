@@ -112,7 +112,7 @@ func TestAPIV1NodeGet(t *testing.T) {
 		assert.Equal(t, "node-c", got.Node["name"])
 		assert.Equal(t, "REGISTER_METHOD_AUTH_KEY", got.Node["registerMethod"])
 		// EmitUnpopulated parity: slices present as [], expiry as null.
-		assert.Equal(t, []any{}, got.Node["ipAddresses"])
+		assert.Equal(t, []any{}, got.Node["approvedRoutes"])
 		assert.Equal(t, []any{}, got.Node["tags"])
 		assert.Nil(t, got.Node["expiry"])
 		assert.Contains(t, got.Node, "user")
@@ -236,6 +236,23 @@ func TestAPIV1NodeExpire(t *testing.T) {
 		assert.Equal(t, "1", got.Node["id"])
 		// Expiry was nil before; expiring sets it to a concrete timestamp.
 		assert.NotNil(t, got.Node["expiry"])
+	})
+
+	// As before the key expiry switch existed: v1 expire logs the node out.
+	t.Run("huma expires a node with key expiry off", func(t *testing.T) {
+		h := newAPIV1Harness(t)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, h.app)
+
+		_, _, err := h.app.state.SetNodeKeyExpiryDisabled(1, true)
+		require.NoError(t, err)
+
+		res := h.callHuma(http.MethodPost, "/api/v1/node/1/expire", nil)
+		require.Equal(t, http.StatusOK, res.status)
+
+		node, ok := h.app.state.GetNodeByID(1)
+		require.True(t, ok)
+		assert.False(t, node.KeyExpiryDisabled())
+		assert.True(t, node.IsExpired())
 	})
 
 	t.Run("huma refuses an unencodable expiry", func(t *testing.T) {

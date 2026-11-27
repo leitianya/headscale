@@ -531,13 +531,21 @@ func (u *Username) resolve(_ *Policy, users types.Users, nodes views.Slice[types
 
 	// user:*@domain names every user of that email domain, as on SaaS.
 	if domain, ok := strings.CutPrefix(string(*u), "user:*@"); ok {
+		matchingUsers := make(map[uint]bool)
+
+		for _, user := range users {
+			_, emailDomain, found := strings.CutLast(user.Email, "@")
+			if found && strings.EqualFold(emailDomain, domain) {
+				matchingUsers[user.ID] = true
+			}
+		}
+
 		for _, node := range nodes.All() {
 			if node.IsTagged() || !node.User().Valid() {
 				continue
 			}
 
-			_, emailDomain, found := strings.CutLast(node.User().Email(), "@")
-			if found && strings.EqualFold(emailDomain, domain) {
+			if matchingUsers[node.User().ID()] {
 				node.AppendToIPSet(&ips)
 			}
 		}
@@ -2486,6 +2494,10 @@ var tailscaleCapAllowlist = map[peercap.Cap]bool{
 	// tailscale.com/cap/secrets is the capability used by setec
 	// (github.com/tailscale/setec); allow it so it can be granted via policy.
 	peercap.Cap("tailscale.com/cap/secrets"): true,
+
+	// tailscale.com/cap/tailsql is the capability tailsql
+	// (github.com/tailscale/tailsql) checks; headscale embeds tailsql.
+	peercap.Cap("tailscale.com/cap/tailsql"): true,
 }
 
 // validateGrantSrcDstCombination validates [Grant]-specific source/destination
@@ -3409,6 +3421,12 @@ func stripMetadataMembers(v *hujson.Value) {
 			stripMetadataMembers(&val.Elements[i])
 		}
 	}
+}
+
+// ParsePolicy parses and validates a policy without users or nodes: syntax,
+// shape and cross-reference checks only. Empty input returns nil, nil.
+func ParsePolicy(b []byte) (*Policy, error) {
+	return unmarshalPolicy(b)
 }
 
 // unmarshalPolicy takes a byte slice and unmarshals it into a [Policy] struct.

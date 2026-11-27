@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	clientv2 "github.com/juanfont/headscale/gen/client/v2"
-	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/spf13/cobra"
 )
 
@@ -104,7 +103,8 @@ var listOAuthClientsCmd = &cobra.Command{
 		}
 		defer cancel()
 
-		resp, err := client.ListKeysWithResponse(ctx, oauthTailnet, nil)
+		// As on Tailscale, an admin key lists OAuth clients only with all=true.
+		resp, err := client.ListKeysWithResponse(ctx, oauthTailnet, &clientv2.ListKeysParams{All: new(true)})
 		if err != nil {
 			return fmt.Errorf("listing oauth clients: %w", err)
 		}
@@ -175,10 +175,7 @@ var deleteOAuthClientCmd = &cobra.Command{
 // (local trust); a remote address injects the configured API key as a bearer
 // token.
 func newV2Client() (context.Context, *clientv2.ClientWithResponses, context.CancelFunc, error) {
-	cfg, err := types.LoadCLIConfig()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("loading configuration: %w", err)
-	}
+	cfg := loaded.Config
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.CLI.Timeout)
 
@@ -201,10 +198,11 @@ func newV2Client() (context.Context, *clientv2.ClientWithResponses, context.Canc
 		return ctx, client, cancel, nil
 	}
 
-	if cfg.CLI.APIKey == "" {
+	apiKey, err := cliAPIKey(cfg.CLI)
+	if err != nil {
 		cancel()
 
-		return nil, nil, nil, errAPIKeyNotSet
+		return nil, nil, nil, err
 	}
 
 	transport := &http.Transport{}
@@ -212,8 +210,6 @@ func newV2Client() (context.Context, *clientv2.ClientWithResponses, context.Canc
 		//nolint:gosec // intentionally honouring the insecure flag
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-
-	apiKey := cfg.CLI.APIKey
 
 	client, err := clientv2.NewClientWithResponses(
 		clientBaseURL(cfg.CLI.Address),

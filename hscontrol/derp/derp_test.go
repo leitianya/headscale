@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 )
@@ -250,14 +249,10 @@ func TestShuffleDERPMapDeterministic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			viper.Set("dns.base_domain", tt.baseDomain)
-
-			defer viper.Reset()
-
 			resetDerpRandomForTesting()
 
 			testMap := tt.derpMap.View().AsStruct()
-			shuffleDERPMap(testMap)
+			shuffleDERPMap(testMap, tt.baseDomain)
 
 			if diff := cmp.Diff(tt.expected, testMap); diff != "" {
 				t.Errorf("Shuffled DERP map doesn't match expected (-expected +actual):\n%s", diff)
@@ -269,10 +264,6 @@ func TestShuffleDERPMapDeterministic(t *testing.T) {
 // TestGetDERPMapKeepsOrderAcrossRefreshes: clients close their home relay when
 // its node order changes, so a refresh of the same input must keep the order.
 func TestGetDERPMapKeepsOrderAcrossRefreshes(t *testing.T) {
-	viper.Set("dns.base_domain", "stable.example.com")
-
-	defer viper.Reset()
-
 	resetDerpRandomForTesting()
 
 	source := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
@@ -286,11 +277,11 @@ func TestGetDERPMapKeepsOrderAcrossRefreshes(t *testing.T) {
 		source.Regions[id+1] = region
 	}
 
-	first, err := GetDERPMap(types.DERPConfig{DERPMap: source})
+	first, err := GetDERPMap(types.DERPConfig{DERPMap: source}, "stable.example.com")
 	require.NoError(t, err)
 
 	for range 5 {
-		next, err := GetDERPMap(types.DERPConfig{DERPMap: source})
+		next, err := GetDERPMap(types.DERPConfig{DERPMap: source}, "stable.example.com")
 		require.NoError(t, err)
 
 		if diff := cmp.Diff(first, next); diff != "" {
@@ -346,13 +337,12 @@ func TestShuffleDERPMapEdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			shuffleDERPMap(tt.derpMap)
+			shuffleDERPMap(tt.derpMap, "")
 		})
 	}
 }
 
 func TestShuffleDERPMapWithoutBaseDomain(t *testing.T) {
-	viper.Reset()
 	resetDerpRandomForTesting()
 
 	derpMap := &tailcfg.DERPMap{
@@ -372,7 +362,7 @@ func TestShuffleDERPMapWithoutBaseDomain(t *testing.T) {
 	}
 
 	original := derpMap.View().AsStruct()
-	shuffleDERPMap(derpMap)
+	shuffleDERPMap(derpMap, "")
 
 	if len(derpMap.Regions) != 1 || len(derpMap.Regions[1].Nodes) != 4 {
 		t.Error("Shuffle corrupted DERP map structure")
@@ -498,4 +488,82 @@ func TestLoadDERPMapFromURLValidates(t *testing.T) {
 
 	_, err = loadDERPMapFromURL(*addr)
 	require.ErrorIs(t, err, ErrRegionIDKey)
+}
+
+// TestGetDERPMapSkipsFailedSources: a derp.urls server is often run by a
+// third party, so one failing source must not cost the regions of the others
+// (https://github.com/juanfont/headscale/issues/3142).
+func TestGetDERPMapSkipsFailedSources(t *testing.T) {
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"Regions": {"1": {"RegionID": 1, "Nodes": [{"Name": "1a", "RegionID": 1}]}}}`))
+	}))
+	defer good.Close()
+
+	down := httptest.NewServer(http.NotFoundHandler())
+	defer down.Close()
+
+	goodURL, err := url.Parse(good.URL)
+	require.NoError(t, err)
+
+	downURL, err := url.Parse(down.URL)
+	require.NoError(t, err)
+
+	goodPath := filepath.Join(t.TempDir(), "good.yaml")
+	require.NoError(t, os.WriteFile(goodPath, []byte(`
+regions:
+  2:
+    regionid: 2
+    nodes:
+      - name: 2a
+        regionid: 2
+`), 0o600))
+
+	brokenPath := filepath.Join(t.TempDir(), "broken.yaml")
+	require.NoError(t, os.WriteFile(brokenPath, []byte("regions: [\n"), 0o600))
+
+	dm, err := GetDERPMap(types.DERPConfig{
+		URLs:  []types.HTTPURL{types.HTTPURL(goodURL.String()), types.HTTPURL(downURL.String())},
+		Paths: []string{goodPath, brokenPath, filepath.Join(t.TempDir(), "missing.yaml")},
+	}, "")
+	require.ErrorIs(t, err, errDERPMapStatus)
+	require.ErrorContains(t, err, down.URL)
+	require.ErrorContains(t, err, brokenPath)
+	require.ErrorContains(t, err, "missing.yaml")
+	require.Contains(t, dm.Regions, tailcfg.DERPRegionID(1))
+	require.Contains(t, dm.Regions, tailcfg.DERPRegionID(2))
+}
+
+// TestGetDERPMapURLParseError: url.Parse errors quote the URL or parts of
+// it, credentials included, so the error names only the setting.
+func TestGetDERPMapURLParseError(t *testing.T) {
+	const marker = "derp-parse-password-marker" //nolint:gosec // test marker, not a real credential
+
+	for _, u := range []string{
+		"https://alice:" + marker + "@derp.example/%zz",
+		"https://alice:" + marker + "?@derp.example/map",
+		"https://alice:" + marker + "#@derp.example/map",
+		"https://alice:" + marker,
+	} {
+		t.Run(u, func(t *testing.T) {
+			_, err := GetDERPMap(types.DERPConfig{URLs: []types.HTTPURL{types.HTTPURL(u)}}, "")
+			require.EqualError(t, err, "derp.urls[0]: invalid URL syntax")
+			require.NotContains(t, err.Error(), marker)
+		})
+	}
+}
+
+// TestLoadDERPMapFromURLRejectsHTTPError: an error page that happens to be
+// JSON must not pass as an empty map, or a refresh drops that URL's regions.
+func TestLoadDERPMapFromURLRejectsHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"message": "down for maintenance"}`))
+	}))
+	defer srv.Close()
+
+	addr, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	_, err = loadDERPMapFromURL(*addr)
+	require.ErrorIs(t, err, errDERPMapStatus)
 }

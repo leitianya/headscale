@@ -58,8 +58,7 @@ func TestExitNodeFilteredSet(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := generateDNSConfig(
 				&types.Config{
-					BaseDomain:       tt.baseDomain,
-					TailcfgDNSConfig: &tailcfg.DNSConfig{Proxied: tt.magicDNS},
+					DNSConfig: types.DNSConfig{MagicDNS: tt.magicDNS, BaseDomain: tt.baseDomain},
 				},
 				(&types.Node{}).View(),
 				nil,
@@ -82,15 +81,14 @@ func TestDNSConfigMapResponse(t *testing.T) {
 				Domains: []string{
 					"foobar.headscale.net",
 				},
-				Proxied: true,
+				Proxied:             true,
+				ExitNodeFilteredSet: []string{".foobar.headscale.net"},
 			},
 		},
 		{
+			// Only MagicDNS answers for the base domain.
 			magicDNS: false,
-			want: &tailcfg.DNSConfig{
-				Domains: []string{"foobar.headscale.net"},
-				Proxied: false,
-			},
+			want:     &tailcfg.DNSConfig{},
 		},
 	}
 
@@ -106,19 +104,11 @@ func TestDNSConfigMapResponse(t *testing.T) {
 				}
 			}
 
-			baseDomain := "foobar.headscale.net"
-
-			dnsConfigOrig := tailcfg.DNSConfig{
-				Routes:  make(map[string][]*dnstype.Resolver),
-				Domains: []string{baseDomain},
-				Proxied: tt.magicDNS,
-			}
-
 			nodeInShared1 := mach("test_get_shared_nodes_1", "shared1", 1)
 
 			got := generateDNSConfig(
 				&types.Config{
-					TailcfgDNSConfig: &dnsConfigOrig,
+					DNSConfig: types.DNSConfig{MagicDNS: tt.magicDNS, BaseDomain: "foobar.headscale.net"},
 				},
 				nodeInShared1.View(),
 				nil,
@@ -135,15 +125,8 @@ func TestNextDNSCapMapRendering(t *testing.T) {
 	t.Parallel()
 
 	mkConfig := func(addrs ...string) *types.Config {
-		resolvers := make([]*dnstype.Resolver, len(addrs))
-		for i, a := range addrs {
-			resolvers[i] = &dnstype.Resolver{Addr: a}
-		}
-
 		return &types.Config{
-			TailcfgDNSConfig: &tailcfg.DNSConfig{
-				Resolvers: resolvers,
-			},
+			DNSConfig: types.DNSConfig{OverrideLocalDNS: true, Nameservers: types.Nameservers{Global: addrs}},
 		}
 	}
 
@@ -274,12 +257,10 @@ func TestNextDNSResolverCompat(t *testing.T) {
 			))
 			require.NoError(t, err)
 
-			resolvers := make([]*dnstype.Resolver, 0, len(c.Input.Tailnet.DNS.Nameservers))
-			for _, ns := range c.Input.Tailnet.DNS.Nameservers {
-				resolvers = append(resolvers, &dnstype.Resolver{Addr: ns})
-			}
-
-			cfg := &types.Config{TailcfgDNSConfig: &tailcfg.DNSConfig{Resolvers: resolvers}}
+			cfg := &types.Config{DNSConfig: types.DNSConfig{
+				OverrideLocalDNS: true,
+				Nameservers:      types.Nameservers{Global: c.Input.Tailnet.DNS.Nameservers},
+			}}
 
 			// Mismatches by check, one entry per node.
 			diffs := map[string][]string{}
@@ -389,11 +370,9 @@ func TestBuildFromChangeFiltersPeerPatchesByVisibility(t *testing.T) {
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 		},
-		PrefixV4:     &p4,
-		PrefixV6:     &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 		DERP: types.DERPConfig{
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -475,11 +454,9 @@ func TestBuildFromChangeFiltersUserProfilesByVisibility(t *testing.T) {
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 		},
-		PrefixV4:     &p4,
-		PrefixV6:     &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 		DERP: types.DERPConfig{
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -560,11 +537,9 @@ func TestBuildFromChangeVisibilityMatchesFullMap(t *testing.T) {
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 		},
-		PrefixV4:     &p4,
-		PrefixV6:     &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 		DERP: types.DERPConfig{
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -772,11 +747,9 @@ func TestFullMapResponseSurvivesPeerWithInvalidData(t *testing.T) {
 					Type:   types.DatabaseSqlite,
 					Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 				},
-				PrefixV4:     &p4,
-				PrefixV6:     &p6,
-				IPAllocation: types.IPAllocationStrategySequential,
-				BaseDomain:   "headscale.test",
-				Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+				Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+				DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+				Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 				DERP: types.DERPConfig{
 					DERPMap: &tailcfg.DERPMap{
 						Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -836,6 +809,105 @@ func TestFullMapResponseSurvivesPeerWithInvalidData(t *testing.T) {
 	}
 }
 
+// TestPeerCarriesOwnCapabilityVersion proves each peer's [tailcfg.Node.Cap]
+// is that peer's own capability version, not the viewer's, as Tailscale
+// SaaS sends it (policy/v2/testdata/capver_results, a 1.86 client beside one at 152).
+// Clients gate per-peer features on it: a new client enables hybrid
+// WireGuard handshakes for any peer with Cap >= 152, so stamping the
+// viewer's version on an older peer makes the new client use a handshake
+// the peer never answers.
+func TestPeerCarriesOwnCapabilityVersion(t *testing.T) {
+	c, err := testcapture.Read(filepath.Join(
+		"..", "policy", "v2", "testdata", "capver_results", "capver-mixed-clients.hujson",
+	))
+	require.NoError(t, err)
+
+	// want[viewer][peer] is the Cap SaaS sent viewer for peer; own[peer]
+	// is then that peer's own version, the one its client reports.
+	want := map[string]map[string]tailcfg.CapabilityVersion{}
+	own := map[string]tailcfg.CapabilityVersion{}
+
+	for viewer, nc := range c.Captures {
+		want[viewer] = map[string]tailcfg.CapabilityVersion{}
+
+		for _, p := range nc.Netmap.Peers {
+			name, _, _ := strings.Cut(p.Name(), ".")
+			want[viewer][name] = p.Cap()
+			own[name] = p.Cap()
+		}
+	}
+
+	require.Len(t, own, 2)
+	require.NotEqual(t, own["old"], own["new"], "the capture must mix client versions")
+
+	tmp := t.TempDir()
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
+		},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
+		DERP: types.DERPConfig{
+			DERPMap: &tailcfg.DERPMap{
+				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
+			},
+		},
+		Tuning: types.Tuning{
+			NodeStoreBatchSize:    state.TestBatchSize,
+			NodeStoreBatchTimeout: state.TestBatchTimeout,
+		},
+	}
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("u1")
+	nodes := map[string]*types.Node{}
+
+	for _, name := range []string{"new", "old", "silent"} {
+		nodes[name] = database.CreateRegisteredNodeForTest(user, name)
+	}
+
+	require.NoError(t, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, err = s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
+	require.NoError(t, err)
+
+	for _, name := range []string{"old", "new"} {
+		n := nodes[name]
+
+		ch, err := s.UpdateNodeFromMapRequest(n.ID, tailcfg.MapRequest{Version: own[name], NodeKey: n.NodeKey})
+		require.NoError(t, err)
+		assert.Equal(t, change.NodeAdded(n.ID), ch, "%s: a new capability version must reach peers", name)
+	}
+
+	m := &mapper{state: s, cfg: cfg}
+
+	for viewer, wantPeers := range want {
+		resp, err := m.fullMapResponse(nodes[viewer].ID, own[viewer])
+		require.NoError(t, err)
+
+		got := map[string]tailcfg.CapabilityVersion{}
+
+		for _, p := range resp.Peers {
+			name, _, _ := strings.Cut(p.Name, ".")
+			got[name] = p.Cap
+		}
+
+		// A node that never sent a MapRequest reports 0: no hybrid.
+		wantPeers["silent"] = 0
+		assert.Equal(t, wantPeers, got, "%s's peers (want SaaS)", viewer)
+	}
+}
+
 // TestGenerateDNSConfigNilHostinfoNoPanic proves generateDNSConfig does not
 // panic when a node's Hostinfo is nil (e.g. a legacy DB row with a NULL
 // host_info column). addNextDNSMetadata dereferenced node.Hostinfo().OS()
@@ -849,11 +921,10 @@ func TestGenerateDNSConfigNilHostinfoNoPanic(t *testing.T) {
 		// Hostinfo intentionally nil, as a legacy NULL host_info row loads.
 	}).View()
 
-	cfg := &types.Config{
-		TailcfgDNSConfig: &tailcfg.DNSConfig{
-			Resolvers: []*dnstype.Resolver{{Addr: "https://dns.nextdns.io/abc"}},
-		},
-	}
+	cfg := &types.Config{DNSConfig: types.DNSConfig{
+		OverrideLocalDNS: true,
+		Nameservers:      types.Nameservers{Global: []string{"https://dns.nextdns.io/abc"}},
+	}}
 
 	require.NotPanics(t, func() {
 		generateDNSConfig(cfg, node, nil)
@@ -1036,11 +1107,9 @@ func TestBackfillNodeIPsReachesBackfilledNode(t *testing.T) {
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 		},
-		PrefixV4:     &p4,
-		PrefixV6:     &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 		DERP: types.DERPConfig{
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -1111,11 +1180,9 @@ func TestFailedExpiryOfPrimaryAnnouncesBackup(t *testing.T) {
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 		},
-		PrefixV4:     &p4,
-		PrefixV6:     &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 		DERP: types.DERPConfig{
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -1203,11 +1270,8 @@ func TestGenerateMapResponseDebugOnlyOnFullMaps(t *testing.T) {
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
 		},
-		PrefixV4:     &p4,
-		PrefixV6:     &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes: types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		Policy:   types.PolicyConfig{Mode: types.PolicyModeDB},
 		DERP: types.DERPConfig{
 			DERPMap: &tailcfg.DERPMap{
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
@@ -1215,7 +1279,7 @@ func TestGenerateMapResponseDebugOnlyOnFullMaps(t *testing.T) {
 		},
 		// Without these the DERP map and DNS config renders carry
 		// nothing and no frame is generated at all.
-		TailcfgDNSConfig: &tailcfg.DNSConfig{Proxied: true},
+		DNSConfig: types.DNSConfig{MagicDNS: true, BaseDomain: "headscale.test"},
 		Tuning: types.Tuning{
 			NodeStoreBatchSize:    state.TestBatchSize,
 			NodeStoreBatchTimeout: state.TestBatchTimeout,
@@ -1291,7 +1355,8 @@ func TestCertDomains(t *testing.T) {
 			"subdomain":  "reg",
 			"server_url": "https://auth.acme-dns.io",
 		},
-	}}, func(string) (any, bool) { return nil, false })
+	}}, func(string) (any, bool) { return nil, false },
+		func(_, v string) (string, error) { return v, nil })
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -1375,22 +1440,20 @@ func TestCertDomains(t *testing.T) {
 				baseDomain = "ts.example.com"
 			}
 
-			cfg := &types.Config{
-				BaseDomain:   baseDomain,
-				DNSConfig:    tt.dns,
-				DNSChallenge: types.DNSChallengeConfig{Provider: tt.provider},
-				TailcfgDNSConfig: &tailcfg.DNSConfig{
-					Proxied: true,
-					ExtraRecords: []tailcfg.DNSRecord{
-						{Name: "Grafana.ts.example.com", Type: "A", Value: "100.64.0.3"},
-						{Name: "grafana.svc.ts.example.com.", Type: "A", Value: "100.64.0.4"},
-					},
-				},
+			dnsCfg := tt.dns
+			dnsCfg.MagicDNS = true
+			dnsCfg.BaseDomain = baseDomain
+			dnsCfg.ExtraRecords = []tailcfg.DNSRecord{
+				{Name: "Grafana.ts.example.com", Type: "A", Value: "100.64.0.3"},
+				{Name: "grafana.svc.ts.example.com.", Type: "A", Value: "100.64.0.4"},
 			}
+
+			cfg := &types.Config{DNSConfig: dnsCfg}
+			cfg.StartDNS(tt.provider)
 
 			got := generateDNSConfig(cfg, tt.node.View(), nil)
 			assert.Equal(t, tt.want, got.CertDomains)
-			assert.Nil(t, cfg.TailcfgDNSConfig.CertDomains, "global DNS config must stay untouched")
+			assert.Nil(t, cfg.CloneTailcfgDNSConfig().CertDomains, "global DNS config must stay untouched")
 		})
 	}
 }
@@ -1781,7 +1844,7 @@ func (b *MapResponseBuilder) buildTailPeersCapMapsReference(peers views.Slice[ty
 		// in the viewer's netmap. The CapMap merge into tn.CapMap is
 		// overwritten by the PeerCapMap call below; only the address
 		// filtering side-effect inside TailNode survives.
-		tn, err := peer.TailNode(b.capVer, func(_ types.NodeID) []netip.Prefix {
+		tn, err := peer.TailNode(peer.CapVer(), func(_ types.NodeID) []netip.Prefix {
 			return b.mapper.state.RoutesForPeer(node, peer, matchers)
 		}, b.mapper.cfg, allCapMaps[peer.ID()])
 		if err != nil {
@@ -1884,10 +1947,9 @@ func capMapsMapperFixture(tb testing.TB, n int, attrs string) (*mapper, []types.
 			Type:   types.DatabaseSqlite,
 			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/caps.db"},
 		},
-		PrefixV4: &p4, PrefixV6: &p6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
-		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Prefixes:  types.PrefixesConfig{V4: &p4, V6: &p6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
+		Policy:    types.PolicyConfig{Mode: types.PolicyModeDB},
 		Tuning: types.Tuning{
 			NodeStoreBatchSize:    state.TestBatchSize,
 			NodeStoreBatchTimeout: state.TestBatchTimeout,

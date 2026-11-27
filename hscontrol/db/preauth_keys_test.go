@@ -207,7 +207,7 @@ func TestCannotDeleteAssignedPreAuthKey(t *testing.T) {
 
 	err = db.DB.Where("kind = ? AND id = ?", types.CredentialPreAuthKey, key.ID).
 		Delete(&types.Credential{}).Error
-	require.ErrorContains(t, err, "constraint failed: FOREIGN KEY constraint failed")
+	require.ErrorIs(t, err, gorm.ErrForeignKeyViolated)
 }
 
 func TestPreAuthKeyAuthentication(t *testing.T) {
@@ -235,6 +235,21 @@ func TestPreAuthKeyAuthentication(t *testing.T) {
 			wantFindErr:     true,
 			findErrIs:       ErrPreAuthKeyNotFound,
 			wantValidateErr: false,
+		},
+		{
+			name: "text_before_prefix_rejected",
+			setupKey: func() string {
+				keyStr, err := db.CreatePreAuthKey(
+					user.TypedID(),
+					true, false, nil, []string{"tag:test"},
+				)
+				require.NoError(t, err)
+
+				// The prefix must start the key, not merely appear in it.
+				return "x" + keyStr.Key
+			},
+			wantFindErr: true,
+			findErrIs:   ErrPreAuthKeyNotFound,
 		},
 		{
 			name: "new_key_sha256",

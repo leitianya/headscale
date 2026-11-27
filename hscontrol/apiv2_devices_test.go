@@ -155,7 +155,7 @@ func TestAPIv2Device_Get(t *testing.T) {
 	assert.True(t, dev.Authorized)
 	assert.Equal(t, e.user.Username(), dev.User)
 	assert.NotNil(t, dev.Tags)
-	assert.True(t, dev.KeyExpiryDisabled, "seeded node has no expiry")
+	assert.False(t, dev.KeyExpiryDisabled, "a user node's key expiry is on")
 	assert.NotEmpty(t, dev.Addresses)
 
 	// Server-side cross-check.
@@ -187,7 +187,7 @@ func TestAPIv2Device_EmptyRouteLists(t *testing.T) {
 // MagicDNS FQDN, in a read and in the list.
 func TestAPIv2Device_NameIsFQDN(t *testing.T) {
 	e := newDeviceTestEnv(t)
-	e.app.cfg.BaseDomain = "tailnet.example.com"
+	e.app.cfg.DNSConfig.BaseDomain = "tailnet.example.com"
 
 	assert.Equal(t, "contract-dut.tailnet.example.com", getDevice(t, e.api, e.deviceID).Name)
 
@@ -231,7 +231,7 @@ func TestAPIv2Device_GetPostureAttributes(t *testing.T) {
 			))
 
 			attrs := getDevicePostureAttributes(t, e.api, e.deviceID)
-			assert.Equal(t, test.addr, attrs.Attributes["ip:publicAddress"])
+			assert.Equal(t, map[string]any{"type": "IpAddr", "value": test.addr}, attrs.Attributes["ip:publicAddress"])
 			assert.Empty(t, attrs.Expiries)
 		})
 	}
@@ -340,23 +340,37 @@ func TestAPIv2Device_SetTags(t *testing.T) {
 	assert.Equal(t, []string{"tag:prod"}, e.srvNode(t).Tags().AsSlice())
 }
 
+// As on Tailscale (capture expire-key-expiry K1-K5, X1-X5): the key switch
+// keeps the expiry time, and expire writes the time whatever the switch says.
 func TestAPIv2Device_SetKey(t *testing.T) {
 	e := newDeviceTestEnv(t)
-	e.seedExpiry(t, time.Now().Add(24*time.Hour))
+	at := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	e.seedExpiry(t, at)
 
-	require.True(t, e.srvNode(t).Expiry().Valid(), "precondition: node has an expiry")
+	setKey := func(disabled bool) {
+		t.Helper()
+		require.Equal(t, http.StatusOK,
+			e.api.Post("/api/v2/device/"+e.deviceID+"/key", map[string]any{"keyExpiryDisabled": disabled}).Code)
+	}
+
 	assert.False(t, getDevice(t, e.api, e.deviceID).KeyExpiryDisabled)
 
-	require.Equal(t, http.StatusOK,
-		e.api.Post("/api/v2/device/"+e.deviceID+"/key", map[string]any{"keyExpiryDisabled": true}).Code)
-	assert.True(t, getDevice(t, e.api, e.deviceID).KeyExpiryDisabled)
-	assert.False(t, e.srvNode(t).Expiry().Valid(), "expiry cleared")
+	setKey(true)
 
-	// Re-enable is accepted as a no-op; expiry stays cleared.
-	require.Equal(t, http.StatusOK,
-		e.api.Post("/api/v2/device/"+e.deviceID+"/key", map[string]any{"keyExpiryDisabled": false}).Code)
-	assert.True(t, getDevice(t, e.api, e.deviceID).KeyExpiryDisabled)
-	assert.False(t, e.srvNode(t).Expiry().Valid())
+	d := getDevice(t, e.api, e.deviceID)
+	assert.True(t, d.KeyExpiryDisabled)
+	require.NotNil(t, d.Expires)
+	assert.True(t, at.Equal(*d.Expires), "the time is kept")
+
+	// Expire writes the time; the switch keeps the node logged in.
+	require.Equal(t, http.StatusOK, e.api.Post("/api/v2/device/"+e.deviceID+"/expire", map[string]any{}).Code)
+	assert.False(t, e.srvNode(t).IsExpired(), "a node with key expiry off stays")
+	assert.True(t, getDevice(t, e.api, e.deviceID).Expires.Before(time.Now().Add(time.Second)))
+
+	// Turning the switch off lets the past time count.
+	setKey(false)
+	assert.False(t, getDevice(t, e.api, e.deviceID).KeyExpiryDisabled)
+	assert.True(t, e.srvNode(t).IsExpired())
 }
 
 func TestAPIv2Device_SetRoutes(t *testing.T) {

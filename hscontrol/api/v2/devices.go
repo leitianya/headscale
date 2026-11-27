@@ -212,7 +212,7 @@ func registerDevices(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		return &deviceOutput{Body: deviceFromView(node, in.Fields == "all", b.Cfg.BaseDomain)}, nil
+		return &deviceOutput{Body: deviceFromView(node, in.Fields == "all", b.Cfg.DNSConfig.BaseDomain)}, nil
 	})
 
 	huma.Register(api, requireScope(huma.Operation{
@@ -253,7 +253,7 @@ func registerDevices(api huma.API, b Backend) {
 		out.Body.Devices = make([]Device, 0, nodes.Len())
 
 		for _, node := range nodes.All() {
-			out.Body.Devices = append(out.Body.Devices, deviceFromView(node, allFields, b.Cfg.BaseDomain))
+			out.Body.Devices = append(out.Body.Devices, deviceFromView(node, allFields, b.Cfg.DNSConfig.BaseDomain))
 		}
 
 		// The NodeStore holds no order, and Tailscale lists devices by name.
@@ -438,15 +438,7 @@ func registerDevices(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		// Only disabling expiry maps cleanly (expiry=nil never expires).
-		// Re-enabling has no target expiry in the Tailscale request and Headscale
-		// stores no original, so it is accepted as a no-op (keeps Terraform
-		// destroy working) rather than guessing a lifetime.
-		if !in.Body.KeyExpiryDisabled {
-			return &emptyOutput{}, nil
-		}
-
-		_, nodeChange, err := b.State.SetNodeExpiry(node.ID(), nil)
+		_, nodeChange, err := b.State.SetNodeKeyExpiryDisabled(node.ID(), in.Body.KeyExpiryDisabled)
 		b.Change(nodeChange)
 
 		if err != nil {
@@ -650,7 +642,7 @@ func deviceFromView(view types.NodeView, allFields bool, baseDomain string) Devi
 		Authorized:         true, // Headscale has no post-registration de-auth state.
 		User:               deviceUser(view),
 		Tags:               emptyIfNil(view.Tags().AsSlice()),
-		KeyExpiryDisabled:  !view.Expiry().Valid(),
+		KeyExpiryDisabled:  view.KeyExpiryDisabled(),
 		Created:            view.CreatedAt(),
 		Hostname:           view.Hostname(),
 		IsEphemeral:        view.IsEphemeral(),
@@ -722,7 +714,8 @@ func deviceFromView(view types.NodeView, allFields bool, baseDomain string) Devi
 func devicePostureAttributesFromView(view types.NodeView) DevicePostureAttributes {
 	attributes := make(map[string]any)
 	if addr := view.LastControlAddress(); addr.Valid() {
-		attributes["ip:publicAddress"] = addr.Get().String()
+		// Tailscale's typed value (probe-J J16).
+		attributes["ip:publicAddress"] = map[string]string{"type": "IpAddr", "value": addr.Get().String()}
 	}
 
 	return DevicePostureAttributes{Attributes: attributes}

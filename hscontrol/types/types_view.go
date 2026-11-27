@@ -250,6 +250,11 @@ func (v NodeView) AuthKey() CredentialView { return v.ж.AuthKey.View() }
 func (v NodeView) Ephemeral() bool                       { return v.ж.Ephemeral }
 func (v NodeView) Expiry() views.ValuePointer[time.Time] { return views.ValuePointerOf(v.ж.Expiry) }
 
+// KeyExpiryDisabled keeps the node from expiring while it is set; Expiry
+// is kept, and counts again once it is cleared. Tailscale stores the two
+// apart the same way.
+func (v NodeView) KeyExpiryDisabled() bool { return v.ж.KeyExpiryDisabled }
+
 // LastSeen is when the node was last in contact with
 // headscale. It is best effort and not persisted.
 func (v NodeView) LastSeen() views.ValuePointer[time.Time] {
@@ -305,7 +310,15 @@ func (v NodeView) SessionEpoch() uint64 { return v.ж.SessionEpoch }
 // overlapping reconnect keeps it. Primary election prefers the
 // oldest. Runtime-only.
 func (v NodeView) SessionStart() time.Time { return v.ж.SessionStart }
-func (v NodeView) String() string          { return v.ж.String() }
+
+// CapVer is the capability version from the node's latest MapRequest,
+// sent to peers as [tailcfg.Node.Cap]. Clients gate peer protocol
+// features on it (e.g. hybrid WireGuard handshakes), so peers must see
+// the node's own version, never the viewer's. 0 until the node sends a
+// MapRequest, which clients read as "nothing new supported".
+// Runtime-only.
+func (v NodeView) CapVer() tailcfg.CapabilityVersion { return v.ж.CapVer }
+func (v NodeView) String() string                    { return v.ж.String() }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _NodeViewNeedsRegeneration = Node(struct {
@@ -328,6 +341,7 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	AuthKey            *Credential
 	Ephemeral          bool
 	Expiry             *time.Time
+	KeyExpiryDisabled  bool
 	LastSeen           *time.Time
 	ApprovedRoutes     Prefixes
 	AutoApprovedRoutes Prefixes
@@ -339,6 +353,7 @@ var _NodeViewNeedsRegeneration = Node(struct {
 	ActiveSessions     int
 	SessionEpoch       uint64
 	SessionStart       time.Time
+	CapVer             tailcfg.CapabilityVersion
 }{})
 
 // View returns a read-only view of PreAuthKey.

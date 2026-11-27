@@ -86,10 +86,8 @@ func persistTestConfig(dbPath string) *types.Config {
 				Path: dbPath,
 			},
 		},
-		PrefixV4:     &prefixV4,
-		PrefixV6:     &prefixV6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
+		Prefixes:  types.PrefixesConfig{V4: &prefixV4, V6: &prefixV6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
 		Policy: types.PolicyConfig{
 			Mode: types.PolicyModeDB,
 		},
@@ -103,9 +101,9 @@ func persistTestConfig(dbPath string) *types.Config {
 func TestLoadedDuplicateNamesAreResolvedInMemory(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
 	cfg := persistTestConfig(dbPath)
-	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
-		{Name: "grafana." + cfg.BaseDomain, Type: "A", Value: "100.64.0.100"},
-	}}
+	cfg.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{
+		{Name: "grafana." + cfg.DNSConfig.BaseDomain, Type: "A", Value: "100.64.0.100"},
+	}
 	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(t, err)
 
@@ -737,9 +735,9 @@ func (failingSetNodesPolicyManager) SetNodes(views.Slice[types.NodeView]) (bool,
 func TestDeleteNodeTwiceReleasesAddressOnce(t *testing.T) {
 	prefix := netip.MustParsePrefix("100.64.0.0/30")
 	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
-	cfg.PrefixV4 = &prefix
-	cfg.PrefixV6 = nil
-	cfg.IPAllocation = types.IPAllocationStrategyRandom
+	cfg.Prefixes.V4 = &prefix
+	cfg.Prefixes.V6 = nil
+	cfg.Prefixes.Allocation = types.IPAllocationStrategyRandom
 
 	s, err := NewState(cfg)
 	require.NoError(t, err)
@@ -1555,7 +1553,7 @@ func TestPostgresUpdatePolicyConcurrentWrites(t *testing.T) {
 			Port: port,
 			Name: strings.TrimLeft(u.Path, "/"),
 			User: u.User.Username(),
-			Pass: pass,
+			Pass: types.Secret(pass),
 			Ssl:  "disable",
 		},
 	}
@@ -1667,6 +1665,22 @@ func TestReloadPolicyEmpty(t *testing.T) {
 	})
 }
 
+// TestNewStateEmptyPolicyFile: startup takes an empty policy file as no
+// policy, although a write, a reload and "headscale check policy" refuse it.
+func TestNewStateEmptyPolicyFile(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.Policy = types.PolicyConfig{
+		Mode: types.PolicyModeFile,
+		Path: filepath.Join(t.TempDir(), "policy.hujson"),
+	}
+
+	require.NoError(t, os.WriteFile(cfg.Policy.Path, nil, 0o600))
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+}
+
 // TestNodeWriteChangeWhenPolicyRefreshFails fails both the NodeStore
 // writer's SetNodes and the caller's. The write still reached the
 // NodeStore, so the change returned with the error must resend the node to
@@ -1728,7 +1742,7 @@ func TestBackfillNodeIPsSurvivesConcurrentPersist(t *testing.T) {
 
 	// Dropping the IPv6 prefix gives the backfill work to do.
 	cfg := persistTestConfig(dbPath)
-	cfg.PrefixV6 = nil
+	cfg.Prefixes.V6 = nil
 
 	s, err := NewState(cfg)
 	require.NoError(t, err)
@@ -2532,6 +2546,116 @@ func TestReauthReplacesReportedTags(t *testing.T) {
 		row, err := s.DB().GetNodeByID(nodeID)
 		require.NoError(t, err)
 		assert.Equal(t, want, row.Hostinfo.RequestTags)
+	}
+}
+
+func TestUpdateUserRefreshesEmailDomainPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		email    string
+		userName string
+		allow    bool
+	}{
+		{name: "other domain", email: "alice@removed.example"},
+		{name: "cleared email with unchanged profile", userName: "alice@allowed.example"},
+		{name: "cleared email"},
+		{name: "malformed email", email: "alice.allowed.example"},
+		{name: "domain suffix", email: "alice@allowed.example.evil"},
+		{name: "domain prefix", email: "alice@notallowed.example"},
+		{name: "case folded domain", email: "alice@ALLOWED.EXAMPLE", allow: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+			database, err := db.NewHeadscaleDatabase(cfg)
+			require.NoError(t, err)
+
+			alice := database.CreateUserForTest("alice")
+
+			alice.Email = "alice@allowed.example"
+			if tt.userName != "" {
+				alice.Name = tt.userName
+			}
+
+			require.NoError(t, database.DB.Save(alice).Error)
+
+			source := database.CreateRegisteredNodeForTest(alice, "source")
+			targetUser := database.CreateUserForTest("target")
+			target := database.CreateRegisteredNodeForTest(targetUser, "target")
+			require.NoError(t, database.Close())
+
+			s, err := NewState(cfg)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+
+			pol := []byte(`{"grants":[{"src":["user:*@allowed.example"],"dst":["target@"],"ip":["*"]}]}`)
+			_, err = s.SetPolicy(pol)
+			require.NoError(t, err)
+
+			src, ok := s.GetNodeByID(source.ID)
+			require.True(t, ok)
+			dst, ok := s.GetNodeByID(target.ID)
+			require.True(t, ok)
+
+			_, initial := s.Filter()
+			require.True(t, src.CanAccess(initial, dst), "the initial email domain grants access")
+			require.Equal(t, 1, s.ListPeers(source.ID).Len())
+
+			previousProfile := src.User().TailscaleUserProfile()
+			_, c, err := s.UpdateUser(types.UserID(alice.ID), func(user *types.User) error {
+				user.Email = tt.email
+
+				return nil
+			})
+			require.NoError(t, err)
+			assert.True(t, c.IncludePolicy, "connected clients must receive the new packet filter")
+
+			src, ok = s.GetNodeByID(source.ID)
+			require.True(t, ok)
+			assert.Equal(t, tt.email, src.User().Email())
+
+			if tt.userName != "" {
+				assert.Equal(t, previousProfile, src.User().TailscaleUserProfile(), "the packet filter refresh must not depend on a profile change")
+			}
+
+			_, live := s.Filter()
+			assert.Equal(t, tt.allow, src.CanAccess(live, dst), "the unchanged policy must use the current email domain")
+
+			wantPeers := 0
+			if tt.allow {
+				wantPeers = 1
+			}
+
+			assert.Equal(t, wantPeers, s.ListPeers(source.ID).Len(), "peer visibility must follow the current email domain")
+
+			users, err := s.ListAllUsers()
+			require.NoError(t, err)
+
+			fresh, err := policyv2.NewPolicyManager(pol, users, s.ListNodes())
+			require.NoError(t, err)
+
+			_, full := fresh.Filter()
+			assert.Equal(t, tt.allow, src.CanAccess(full, dst), "a fresh compile is the policy control")
+
+			_, err = s.SetPolicy(append(pol, '\n'))
+			require.NoError(t, err)
+
+			_, reloaded := s.Filter()
+			assert.Equal(t, tt.allow, src.CanAccess(reloaded, dst), "an explicit reload must agree with the user update")
+
+			_, c, err = s.UpdateUser(types.UserID(alice.ID), func(user *types.User) error {
+				user.Email = "alice@allowed.example"
+
+				return nil
+			})
+			require.NoError(t, err)
+			assert.True(t, c.IncludePolicy)
+
+			_, restored := s.Filter()
+			assert.True(t, src.CanAccess(restored, dst), "returning to the domain must restore access without a policy write")
+			assert.Equal(t, 1, s.ListPeers(source.ID).Len())
+		})
 	}
 }
 

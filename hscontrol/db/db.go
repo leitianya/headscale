@@ -33,11 +33,7 @@ var errDatabaseNotSupported = errors.New("database type not supported")
 
 var errForeignKeyConstraintsViolated = errors.New("foreign key constraints violated")
 
-const (
-	maxIdleConns   = 100
-	maxOpenConns   = 100
-	contextTimeout = 10 * time.Second
-)
+const contextTimeout = 10 * time.Second
 
 type HSDatabase struct {
 	DB  *gorm.DB
@@ -48,7 +44,7 @@ type HSDatabase struct {
 //
 //nolint:gocyclo // migration closures inflate the count; each is linear
 func NewHeadscaleDatabase(cfg *types.Config) (*HSDatabase, error) {
-	dbConn, err := openDB(cfg.Database)
+	dbConn, err := openDB(cfg.Database, cfg.SQLitePath())
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +65,8 @@ func NewHeadscaleDatabase(cfg *types.Config) (*HSDatabase, error) {
 		[]*gormigrate.Migration{
 			// New migrations must be added as transactions at the end of this list.
 			// Migrations start from v0.29.0; older databases are rejected by
-			// checkMinimumMigration and must upgrade to the latest 0.29.x first.
+			// checkMinimumMigration and must upgrade one minor release at a time
+			// to the latest 0.29.x first.
 			//
 			// Rules:
 			// - NEVER use gorm.AutoMigrate, write the exact migration steps needed
@@ -373,6 +370,41 @@ WHERE auth_key_id IN (
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				// Key expiry becomes a switch beside the expiry time, as on
+				// Tailscale. Tagged nodes had expiry turned off by clearing the
+				// time; the switch now says so, so they still never expire.
+				ID: "202611171200-node-key-expiry-disabled",
+				Migrate: func(tx *gorm.DB) error {
+					return tx.Transaction(func(tx *gorm.DB) error {
+						if tx.Migrator().HasColumn(&types.Node{}, "key_expiry_disabled") {
+							return nil
+						}
+
+						colType := "numeric"
+						if tx.Name() != sqlite.DriverName {
+							colType = "boolean"
+						}
+
+						err := tx.Exec(`ALTER TABLE nodes ADD COLUMN key_expiry_disabled ` + colType + ` DEFAULT false`).Error
+						if err != nil {
+							return fmt.Errorf("adding key_expiry_disabled to nodes: %w", err)
+						}
+
+						// The tagged-node predicate of 202607241200-clear-tagged-node-expiry.
+						err = tx.Exec(`
+UPDATE nodes SET key_expiry_disabled = true
+WHERE tags IS NOT NULL AND tags != '[]' AND tags != '' AND tags != 'null';
+							`).Error
+						if err != nil {
+							return fmt.Errorf("disabling key expiry on tagged nodes: %w", err)
+						}
+
+						return nil
+					})
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 
@@ -456,21 +488,23 @@ WHERE auth_key_id IN (
 	// This is currently only done on sqlite as squibble does not
 	// support Postgres and we use our sqlite schema as our source of
 	// truth.
-	if cfg.Database.Type == types.DatabaseSqlite {
+	if cfg.Database.IsSQLite() {
 		sqlConn, err := dbConn.DB()
 		if err != nil {
 			return nil, fmt.Errorf("getting DB from gorm: %w", err)
 		}
 
-		// or else it blocks...
-		sqlConn.SetMaxIdleConns(maxIdleConns)
-
-		sqlConn.SetMaxOpenConns(maxOpenConns)
-		defer sqlConn.SetMaxIdleConns(1)
-		defer sqlConn.SetMaxOpenConns(1)
-
 		ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
 		defer cancel()
+
+		// squibble nests queries. Without WAL a second connection would
+		// hang: its opening pragmas write, and the write waits for the
+		// first connection's read.
+		conn, err := sqlConn.Conn(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting connection for schema validation: %w", err)
+		}
+		defer conn.Close()
 
 		opts := squibble.DigestOptions{
 			IgnoreTables: []string{
@@ -482,7 +516,7 @@ WHERE auth_key_id IN (
 			},
 		}
 
-		if err := squibble.Validate(ctx, sqlConn, dbSchema, &opts); err != nil { //nolint:noinlineerr
+		if err := squibble.Validate(ctx, conn, dbSchema, &opts); err != nil { //nolint:noinlineerr
 			return nil, fmt.Errorf("validating schema: %w", err)
 		}
 	}
@@ -495,18 +529,20 @@ WHERE auth_key_id IN (
 	return &db, err
 }
 
-func openDB(cfg types.DatabaseConfig) (*gorm.DB, error) {
+// openDB opens the database cfg names; sqlitePath is database.sqlite.path
+// resolved.
+func openDB(cfg types.DatabaseConfig, sqlitePath string) (*gorm.DB, error) {
 	// TODO(kradalby): Integrate this with zerolog
 	var dbLogger logger.Interface
 	if cfg.Debug {
-		dbLogger = util.NewDBLogWrapper(&log.Logger, cfg.Gorm.SlowThreshold, cfg.Gorm.SkipErrRecordNotFound, cfg.Gorm.ParameterizedQueries)
+		dbLogger = util.NewDBLogWrapper(&log.Logger, time.Duration(cfg.Gorm.SlowThreshold)*time.Millisecond, cfg.Gorm.SkipErrRecordNotFound, cfg.Gorm.ParameterizedQueries)
 	} else {
 		dbLogger = logger.Default.LogMode(logger.Silent)
 	}
 
-	switch cfg.Type {
-	case types.DatabaseSqlite:
-		dir := filepath.Dir(cfg.Sqlite.Path)
+	switch {
+	case cfg.IsSQLite():
+		dir := filepath.Dir(sqlitePath)
 
 		err := util.EnsureDir(dir)
 		if err != nil {
@@ -514,15 +550,20 @@ func openDB(cfg types.DatabaseConfig) (*gorm.DB, error) {
 		}
 
 		log.Info().
-			Str("database", types.DatabaseSqlite).
-			Str("path", cfg.Sqlite.Path).
+			Str("database", string(types.DatabaseSqlite)).
+			Str("path", sqlitePath).
 			Msg("Opening database")
 
 		// Build SQLite configuration with pragmas set at connection time
-		sqliteConfig := sqliteconfig.Default(cfg.Sqlite.Path)
+		sqliteConfig := sqliteconfig.Default(sqlitePath)
 		if cfg.Sqlite.WriteAheadLog {
-			sqliteConfig.JournalMode = sqliteconfig.JournalModeWAL
 			sqliteConfig.WALAutocheckpoint = cfg.Sqlite.WALAutoCheckPoint
+		} else {
+			// The journal mode persists in the file, so leaving it unset keeps
+			// a database an earlier run put in WAL mode there. FULL is SQLite's
+			// default for a rollback journal; NORMAL can corrupt it on power loss.
+			sqliteConfig.JournalMode = sqliteconfig.JournalModeDelete
+			sqliteConfig.Synchronous = sqliteconfig.SynchronousFull
 		}
 
 		connectionURL, err := sqliteConfig.ToURL()
@@ -539,6 +580,8 @@ func openDB(cfg types.DatabaseConfig) (*gorm.DB, error) {
 			sqlite.Open(connectionURL),
 			&gorm.Config{
 				Logger: dbLogger,
+				// Callers match gorm.ErrDuplicatedKey, not driver text.
+				TranslateError: true,
 			},
 		)
 		if err != nil {
@@ -559,18 +602,26 @@ func openDB(cfg types.DatabaseConfig) (*gorm.DB, error) {
 
 		return db, nil
 
-	case types.DatabasePostgres:
+	case cfg.Type == types.DatabasePostgres:
 		// Log the DSN without the password.
-		redacted := cfg.Postgres
-		redacted.Pass = ""
+		pg := cfg.Postgres
+		pg.Pass = ""
 
 		log.Info().
-			Str(zf.Database, types.DatabasePostgres).
-			Str(zf.Path, redacted.DSN()).
+			Str(zf.Database, string(types.DatabasePostgres)).
+			Str(zf.Path, pg.DSN()).
 			Msg("Opening database")
 
-		db, err := gorm.Open(postgres.Open(cfg.Postgres.DSN()), &gorm.Config{
-			Logger: dbLogger,
+		pass, err := types.ResolveSecret("database.postgres.pass", string(cfg.Postgres.Pass))
+		if err != nil {
+			return nil, err
+		}
+
+		pg.Pass = types.Secret(pass)
+
+		db, err := gorm.Open(postgres.Open(pg.DSN()), &gorm.Config{
+			Logger:         dbLogger,
+			TranslateError: true,
 		})
 		if err != nil {
 			return nil, err
@@ -598,7 +649,7 @@ func openDB(cfg types.DatabaseConfig) (*gorm.DB, error) {
 }
 
 func runMigrations(cfg types.DatabaseConfig, dbConn *gorm.DB, migrations *gormigrate.Gormigrate) error {
-	if cfg.Type == types.DatabaseSqlite {
+	if cfg.IsSQLite() {
 		if err := migrations.Migrate(); err != nil { //nolint:noinlineerr
 			return err
 		}
@@ -674,7 +725,7 @@ func (hsdb *HSDatabase) Close() error {
 		return err
 	}
 
-	if hsdb.cfg.Database.Type == types.DatabaseSqlite && hsdb.cfg.Database.Sqlite.WriteAheadLog {
+	if hsdb.cfg.Database.IsSQLite() && hsdb.cfg.Database.Sqlite.WriteAheadLog {
 		db.Exec("VACUUM") //nolint:errcheck,noctx
 	}
 

@@ -312,10 +312,35 @@ func TestOAuthClientRevoke(t *testing.T) {
 
 	require.NoError(t, db.RevokeOAuthClient(client.ClientID))
 
-	// The client no longer authenticates and a repeated revoke is a clean 404.
+	// The client no longer authenticates and its tokens are gone, but it stays
+	// readable as revoked, and a repeated revoke keeps the first time, as on
+	// Tailscale (probe-G H6-H8).
 	_, err = db.AuthenticateOAuthClient(secret)
+	require.ErrorIs(t, err, ErrOAuthClientRevoked)
+
+	var tokens int64
+	require.NoError(t, db.DB.Model(&types.Credential{}).
+		Where("kind = ? AND client_id = ?", types.CredentialOAuthToken, client.ClientID).Count(&tokens).Error)
+	assert.Zero(t, tokens)
+
+	revoked, err := db.GetOAuthClientByClientID(client.ClientID)
+	require.NoError(t, err)
+	require.NotNil(t, revoked.Revoked)
+
+	require.NoError(t, db.RevokeOAuthClient(client.ClientID))
+	again, err := db.GetOAuthClientByClientID(client.ClientID)
+	require.NoError(t, err)
+	assert.Equal(t, revoked.Revoked, again.Revoked)
+
+	require.ErrorIs(t, db.RevokeOAuthClient("unknown"), ErrOAuthClientNotFound)
+
+	// The collector removes it once the retention window has passed.
+	n, err := db.DestroyRevokedOAuthClientsBefore(revoked.Revoked.Add(time.Second))
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	_, err = db.GetOAuthClientByClientID(client.ClientID)
 	require.Error(t, err)
-	require.ErrorIs(t, db.RevokeOAuthClient(client.ClientID), ErrOAuthClientNotFound)
 }
 
 func TestOAuthAccessTokenMintAuthenticateExpire(t *testing.T) {
@@ -340,6 +365,12 @@ func TestOAuthAccessTokenMintAuthenticateExpire(t *testing.T) {
 	assert.Equal(t, client.ClientID, got.ClientID)
 	assert.Equal(t, []string{"auth_keys"}, got.Scopes)
 	assert.Equal(t, []string{"tag:ci"}, got.Tags)
+
+	// The prefix must start the token, not merely appear in it.
+	for _, s := range []string{"x" + tokenStr, " " + tokenStr} {
+		_, err = db.AuthenticateAccessToken(s)
+		require.ErrorIs(t, err, ErrAccessTokenFailedToParse, "%q", s)
+	}
 
 	// An expired token is rejected even though the row still exists.
 	past := time.Now().Add(-time.Hour)
